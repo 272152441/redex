@@ -61,12 +61,6 @@
  * TODO?: make MethodItemEntry's fields private?
  */
 
-namespace inliner {
-namespace impl {
-struct BlockAccessor;
-} // namespace impl
-} // namespace inliner
-
 namespace source_blocks {
 namespace impl {
 struct BlockAccessor;
@@ -400,7 +394,6 @@ class Block final {
   friend class CFGInliner;
   friend class InstructionIteratorImpl<false>;
   friend class InstructionIteratorImpl<true>;
-  friend struct ::inliner::impl::BlockAccessor;
   friend struct ::source_blocks::impl::BlockAccessor;
 
   // return an iterator to the conditional branch (including switch) in this
@@ -768,27 +761,31 @@ class ControlFlowGraph {
       const std::vector<std::pair<int32_t, Block*>>& case_to_block);
 
   // delete old blocks and reroute its predecessors to new blocks
-  void replace_blocks(
+  // Returns number of removed instructions.
+  uint32_t replace_blocks(
       const std::vector<std::pair<Block*, Block*>>& old_new_blocks);
 
   // delete old_block and reroute its predecessors to new_block
   // Note that replacing blocks is relatively expensive as it scans and fixes up
   // dangling parent positions in all other blocks; consider calling
   // remove_blocks to remove multiple blocks at once.
-  void replace_block(Block* old_block, Block* new_block) {
-    replace_blocks({{old_block, new_block}});
+  // Returns number of removed instructions.
+  uint32_t replace_block(Block* old_block, Block* new_block) {
+    return replace_blocks({{old_block, new_block}});
   }
 
   // Remove blocks from the graph and release associated memory.
   // Remove all incoming and outgoing edges.
-  void remove_blocks(const std::vector<Block*>& blocks);
+  // Returns number of removed instructions.
+  uint32_t remove_blocks(const std::vector<Block*>& blocks);
 
   // Remove this block from the graph and release associated memory.
   // Remove all incoming and outgoing edges.
   // Note that removing blocks is relatively expensive as it scans and fixes up
   // dangling parent positions in all other blocks; consider calling
   // remove_blocks to remove multiple blocks at once.
-  void remove_block(Block* block) { remove_blocks({block}); }
+  // Returns number of removed instructions.
+  uint32_t remove_block(Block* block) { return remove_blocks({block}); }
 
   /*
    * Print the graph in the DOT graph description language.
@@ -808,9 +805,13 @@ class ControlFlowGraph {
    */
   boost::dynamic_bitset<> visit() const;
 
+  cfg::Block* get_block(BlockId id) const { return m_blocks.at(id); }
+
   // remove blocks with no predecessors
-  // returns the number of instructions removed
-  uint32_t remove_unreachable_blocks();
+  // returns pair of 1) the number of instructions removed, and 2) whether an
+  // instruction with the destination of the last register was removed, and thus
+  // a call to recompute_registers_size might be beneficial.
+  std::pair<uint32_t, bool> remove_unreachable_blocks();
 
   // transform the CFG to an equivalent but more canonical state
   // Assumes m_editable is true
@@ -880,6 +881,8 @@ class ControlFlowGraph {
    * Find the first debug position preceding an instruction
    */
   DexPosition* get_dbg_pos(const cfg::InstructionIterator& it);
+
+  std::size_t opcode_hash() const;
 
  private:
   using BranchToTargets =

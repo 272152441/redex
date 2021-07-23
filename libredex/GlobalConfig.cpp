@@ -9,21 +9,22 @@
 
 void InlinerConfig::bind_config() {
   bind("true_virtual_inline", true_virtual_inline, true_virtual_inline);
-  bind("use_cfg_inliner", use_cfg_inliner, use_cfg_inliner);
   bind("intermediate_shrinking", intermediate_shrinking,
        intermediate_shrinking);
   bind("enforce_method_size_limit", enforce_method_size_limit,
        enforce_method_size_limit);
   bind("throws", throws_inline, throws_inline);
+  bind("throw_after_no_return", throw_after_no_return, throw_after_no_return);
   bind("multiple_callers", multiple_callers, multiple_callers);
-  bind("inline_small_non_deletables", inline_small_non_deletables,
-       inline_small_non_deletables);
+  bind("delete_any_candidate", delete_any_candidate, delete_any_candidate);
   bind("run_const_prop", shrinker.run_const_prop, shrinker.run_const_prop);
   bind("run_cse", shrinker.run_cse, shrinker.run_cse);
   bind("run_dedup_blocks", shrinker.run_dedup_blocks,
        shrinker.run_dedup_blocks);
   bind("run_copy_prop", shrinker.run_copy_prop, shrinker.run_copy_prop);
   bind("run_reg_alloc", shrinker.run_reg_alloc, shrinker.run_reg_alloc);
+  bind("run_fast_reg_alloc", shrinker.run_fast_reg_alloc,
+       shrinker.run_fast_reg_alloc);
   bind("run_local_dce", shrinker.run_local_dce, shrinker.run_local_dce);
   bind("no_inline_annos", {}, m_no_inline_annos);
   bind("force_inline_annos", {}, m_force_inline_annos);
@@ -97,6 +98,7 @@ void GlobalConfig::bind_config() {
   bind("emit_class_method_info_map", false, bool_param);
   bind("emit_locator_strings", {}, bool_param);
   bind("iodi_disable_min_sdk_opt", false, bool_param);
+  bind("symbolicate_detached_methods", false, bool_param);
   bind("ab_experiments_states", {}, string_map_param);
   bind("force_single_dex", false, bool_param);
   bind("instruction_size_bitwidth_limit", 0u, uint32_param);
@@ -121,6 +123,8 @@ void GlobalConfig::bind_config() {
   bind("write_cfg_each_pass", false, bool_param);
   bind("dump_cfg_classes", "", string_param);
   bind("slow_invariants_debug", false, bool_param);
+  // Enabled for ease of testing, apps expected to opt-out
+  bind("enable_bleeding_edge_app_bundle_support", true, bool_param);
 
   for (const auto& entry : m_registry) {
     m_global_configs.emplace(entry.name,

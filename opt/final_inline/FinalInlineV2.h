@@ -7,7 +7,10 @@
 
 #pragma once
 
+#include <optional>
+
 #include "ConstantPropagationWholeProgramState.h"
+#include "DexClass.h"
 #include "IRCode.h"
 #include "Pass.h"
 #include "PatriciaTreeSetAbstractDomain.h"
@@ -38,12 +41,14 @@ class FinalInlinePassV2 : public Pass {
 
   static size_t run(const Scope&,
                     const XStoreRefs*,
-                    const Config& config = Config());
+                    const Config& config = Config(),
+                    std::optional<DexStoresVector*> stores = std::nullopt);
   static size_t run_inline_ifields(
       const Scope&,
       const XStoreRefs*,
       const constant_propagation::EligibleIfields& eligible_ifields,
-      const Config& config = Config());
+      const Config& config = Config(),
+      std::optional<DexStoresVector*> stores = std::nullopt);
   void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 
  private:
@@ -67,6 +72,7 @@ class class_initialization_cycle : public std::exception {
 constant_propagation::WholeProgramState analyze_and_simplify_clinits(
     const Scope& scope,
     const XStoreRefs* xstores,
+    const std::unordered_set<const DexType*>& blocklist_types = {},
     const std::unordered_set<std::string>& allowed_opaque_callee_names = {});
 
 class StaticFieldReadAnalysis {

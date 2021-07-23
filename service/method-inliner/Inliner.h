@@ -7,15 +7,10 @@
 
 #pragma once
 
-#include <atomic>
 #include <functional>
 #include <vector>
 
-#include "DexClass.h"
-#include "IRCode.h"
-#include "MethodProfiles.h"
-#include "PatriciaTreeSet.h"
-#include "PriorityThreadPool.h"
+#include "PriorityThreadPoolDAGScheduler.h"
 #include "Resolver.h"
 #include "Shrinker.h"
 
@@ -26,52 +21,16 @@ namespace inliner {
 struct InlinerConfig;
 
 /*
- * Inline tail-called `callee` into `caller` at `pos`.
- *
- * NB: This is NOT a general-purpose inliner; it assumes that the caller does
- * not do any work after the call, so the only live registers are the
- * parameters to the callee. This allows it to do inlining by simply renaming
- * the callee's registers. The more general inline_method instead inserts
- * move instructions to map the caller's argument registers to the callee's
- * params.
- *
- * In general, use of this method should be considered deprecated. It is
- * currently only being used by the BridgePass because the insertion of
- * additional move instructions would confuse SynthPass, which looks for
- * exact sequences of instructions.
- */
-void inline_tail_call(DexMethod* caller,
-                      DexMethod* callee,
-                      IRList::iterator pos);
-
-/*
- * Inline `callee` into `caller` at `pos` but not check if the caller method has
- * the permit to call the inlined code.
- *
- * `caller_method` is only used to synthesize a DexPosition entry, if necessary.
- * It is permissable to use nullptr, in which case no insertion takes place.
- */
-void inline_method_unsafe(const DexMethod* caller_method,
-                          IRCode* caller,
-                          IRCode* callee,
-                          const IRList::iterator& pos);
-
-/**
- * Inline `callee` into `caller` at `pos` and try to change the visibility of
- * accessed members. See comment of `change_visibility` for details.
- */
-void inline_method(DexMethod* caller,
-                   IRCode* callee,
-                   const IRList::iterator& pos);
-
-/*
  * Use the editable CFG instead of IRCode to do the inlining. Return true on
  * success. Registers starting with next_caller_reg must be available
  */
-bool inline_with_cfg(DexMethod* caller_method,
-                     DexMethod* callee_method,
-                     IRInstruction* callsite,
-                     size_t next_caller_reg);
+bool inline_with_cfg(
+    DexMethod* caller_method,
+    DexMethod* callee_method,
+    IRInstruction* callsite,
+    DexType* needs_receiver_cast,
+    size_t next_caller_reg,
+    const std::unordered_set<cfg::Block*>* dead_blocks = nullptr);
 
 } // namespace inliner
 
@@ -84,27 +43,51 @@ enum MultiMethodInlinerMode {
   IntraDex,
 };
 
-using CalleeCallerInsns = std::unordered_map<
-    DexMethod*,
-    std::unordered_map<DexMethod*, std::unordered_set<IRInstruction*>>>;
+// All call-sites of a callee.
+struct CallerInsns {
+  // Invoke instructions per caller
+  std::unordered_map<const DexMethod*, std::unordered_set<IRInstruction*>>
+      caller_insns;
+  // Invoke instructions that need a cast
+  std::unordered_map<IRInstruction*, DexType*> inlined_invokes_need_cast;
+  // Whether there may be any other unknown call-sites.
+  bool other_call_sites{false};
+  bool empty() const { return caller_insns.empty() && !other_call_sites; }
+};
 
-using ConstantArguments = constant_propagation::interprocedural::ArgumentDomain;
+using CalleeCallerInsns = std::unordered_map<DexMethod*, CallerInsns>;
 
-using InvokeConstantArguments =
-    std::vector<std::pair<IRList::iterator, ConstantArguments>>;
+using CallSiteArguments = constant_propagation::interprocedural::ArgumentDomain;
 
-struct InvokeConstantArgumentsAndDeadBlocks {
-  InvokeConstantArguments invoke_constant_arguments;
+struct CallSiteSummary {
+  CallSiteArguments arguments;
+  bool result_used;
+};
+
+using InvokeCallSiteSummaries =
+    std::vector<std::pair<IRList::iterator, CallSiteSummary>>;
+
+struct InvokeCallSiteSummariesAndDeadBlocks {
+  InvokeCallSiteSummaries invoke_call_site_summaries;
   size_t dead_blocks{0};
 };
 
-using ConstantArgumentsOccurrences = std::pair<ConstantArguments, size_t>;
+using CallSiteSummaryOccurrences = std::pair<CallSiteSummary, size_t>;
 
 struct Inlinable {
   DexMethod* callee;
+  // Only used when not using cfg; iterator to invoke instruction to callee
   IRList::iterator iterator;
+  // Invoke instruction to callee
   IRInstruction* insn;
-  bool optional{true};
+  // Whether the invocation at a particular call-site is guaranteed to not
+  // return normally, and instead of inlining, a throw statement should be
+  // inserted afterwards.
+  bool no_return{false};
+  // Dead-blocks in the callee at a particular call-site
+  const std::unordered_set<cfg::Block*>* dead_blocks;
+  // Estimated size of callee, possibly reduced by call-site specific knowledge
+  size_t insn_size;
 };
 
 struct CalleeCallerRefs {
@@ -112,10 +95,32 @@ struct CalleeCallerRefs {
   size_t classes;
 };
 
+// The average or call-site specific inlined costs, depending on how it is
+// retrieved
 struct InlinedCost {
-  size_t code;
-  size_t method_refs;
-  size_t other_refs;
+  // Full code costs of the original callee
+  size_t full_code;
+  // Average or call-site specific code costs of the callee after pruning
+  float code;
+  // Average or call-site specific method-refs count of the callee after pruning
+  float method_refs;
+  // Average or call-site specific others-refs count of the callee after pruning
+  float other_refs;
+  // Whether all or a specific call-site is guaranteed to not return normally
+  bool no_return;
+  // Average or call-site specific value indicating whether result is used
+  float result_used;
+  // For a specific call-site, a set of known dead blocks in the callee
+  std::unordered_set<cfg::Block*> dead_blocks;
+  // Maximum or call-site specific estimated callee size after pruning
+  size_t insn_size;
+
+  bool operator==(const InlinedCost& other) {
+    return full_code == other.full_code && code == other.code &&
+           method_refs == other.method_refs && other_refs == other.other_refs &&
+           no_return == other.no_return && result_used == other.result_used &&
+           dead_blocks == other.dead_blocks && insn_size == other.insn_size;
+  }
 };
 
 /**
@@ -143,8 +148,6 @@ class MultiMethodInliner {
       MultiMethodInlinerMode mode = InterDex,
       const CalleeCallerInsns& true_virtual_callers = {},
       InlineForSpeed* inline_for_speed = nullptr,
-      const std::unordered_map<const DexMethod*, size_t>*
-          same_method_implementations = nullptr,
       bool analyze_and_prune_inits = false,
       const std::unordered_set<DexMethodRef*>& configured_pure_methods = {},
       const std::unordered_set<DexString*>& configured_finalish_field_names =
@@ -155,7 +158,7 @@ class MultiMethodInliner {
   /**
    * attempt inlining for all candidates.
    */
-  void inline_methods();
+  void inline_methods(bool methods_need_deconstruct = true);
 
   /**
    * Return the set of unique inlined methods.
@@ -171,8 +174,8 @@ class MultiMethodInliner {
    * Inline callees in the caller if is_inlinable below returns true.
    */
   void inline_callees(DexMethod* caller,
-                      const std::vector<DexMethod*>& callees,
-                      const std::vector<DexMethod*>& optional_callees = {});
+                      const std::unordered_set<DexMethod*>& callees,
+                      bool filter_via_should_inline = false);
 
   /**
    * Inline callees in the given instructions in the caller, if is_inlinable
@@ -189,7 +192,8 @@ class MultiMethodInliner {
   bool is_inlinable(const DexMethod* caller,
                     const DexMethod* callee,
                     const IRInstruction* insn,
-                    size_t estimated_insn_size,
+                    uint64_t estimated_caller_size,
+                    uint64_t estimated_callee_size,
                     std::vector<DexMethod*>* make_static,
                     bool* caller_too_large_ = nullptr);
 
@@ -202,25 +206,15 @@ class MultiMethodInliner {
   shrinker::Shrinker& get_shrinker() { return m_shrinker; }
 
  private:
-  void caller_inline(DexMethod* caller,
-                     const std::vector<DexMethod*>& nonrecursive_callees);
-
-  using CallerNonrecursiveCalleesByStackDepth = std::unordered_map<
-      size_t,
-      std::vector<std::pair<DexMethod*, std::vector<DexMethod*>>>>;
-
   /**
    * Determine order in which to inline.
    * Recurse in a callee if that has inlinable candidates of its own.
    * Inlining is bottom up.
    */
-  size_t compute_caller_nonrecursive_callees_by_stack_depth(
-      DexMethod* caller,
-      const std::vector<DexMethod*>& callees,
-      sparta::PatriciaTreeSet<DexMethod*> call_stack,
-      std::unordered_map<DexMethod*, size_t>* visited,
-      CallerNonrecursiveCalleesByStackDepth*
-          caller_nonrecursive_callees_by_stack_depth);
+  size_t prune_caller_nonrecursive_callees(
+      DexMethod* caller, std::unordered_map<DexMethod*, size_t>* visited);
+
+  DexMethod* get_callee(DexMethod* caller, IRInstruction* insn);
 
   void inline_inlinables(DexMethod* caller,
                          const std::vector<Inlinable>& inlinables);
@@ -306,7 +300,7 @@ class MultiMethodInliner {
   bool cross_store_reference(const DexMethod* caller, const DexMethod* callee);
 
   bool is_estimate_over_max(uint64_t estimated_caller_size,
-                            const DexMethod* callee,
+                            uint64_t estimated_callee_size,
                             uint64_t max);
 
   /**
@@ -318,8 +312,8 @@ class MultiMethodInliner {
    * registers.
    */
   bool caller_too_large(DexType* caller_type,
-                        size_t estimated_caller_size,
-                        const DexMethod* callee);
+                        uint64_t estimated_caller_size,
+                        uint64_t estimated_callee_size);
 
   /**
    * Return whether the callee should be inlined into the caller. This differs
@@ -334,14 +328,20 @@ class MultiMethodInliner {
    * a call to `inline_methods()`, but not if `inline_callees()` is invoked
    * directly.
    */
-  bool should_inline(const DexMethod* callee);
+  bool should_inline_always(const DexMethod* callee);
 
   /**
    * Whether it's beneficial to inline the callee at a particular callsite.
+   * no_return may be set to true when the return value is false.
+   * dead_blocks and insn_size are set when the return value is true.
    */
-  bool should_inline_optional(DexMethod* caller,
-                              const IRInstruction* invoke_insn,
-                              DexMethod* callee);
+  bool should_inline_at_call_site(
+      DexMethod* caller,
+      const IRInstruction* invoke_insn,
+      DexMethod* callee,
+      bool* no_return,
+      const std::unordered_set<cfg::Block*>** dead_blocks,
+      size_t* insn_size);
 
   /**
    * should_inline_fast will return true for a subset of methods compared to
@@ -372,9 +372,28 @@ class MultiMethodInliner {
   bool too_many_callers(const DexMethod* callee);
 
   /**
-   * Estimate inlined cost for a single invocation of a method.
+   * Estimate inlined cost for fully inlining a callee without using any
+   * summaries for pruning.
    */
-  InlinedCost get_inlined_cost(const DexMethod* callee);
+  const InlinedCost* get_fully_inlined_cost(const DexMethod* callee);
+
+  /**
+   * Estimate average inlined cost when inlining a callee, considering all
+   * call-site summaries for pruning.
+   */
+  const InlinedCost* get_average_inlined_cost(const DexMethod* callee);
+
+  /**
+   * Estimate inlined cost for a particular call-site, if available.
+   */
+  const InlinedCost* get_call_site_inlined_cost(
+      const IRInstruction* invoke_insn, const DexMethod* callee);
+
+  /**
+   * Estimate inlined cost for a particular call-site summary, if available.
+   */
+  const InlinedCost* get_call_site_inlined_cost(
+      const CallSiteSummary& call_site_summary, const DexMethod* callee);
 
   /**
    * Change visibilities of methods, assuming that`m_change_visibility` is
@@ -396,19 +415,20 @@ class MultiMethodInliner {
    * information about their arguments, i.e. whether particular arguments
    * are constants.
    */
-  boost::optional<InvokeConstantArgumentsAndDeadBlocks>
-  get_invoke_constant_arguments(DexMethod* caller,
-                                const std::vector<DexMethod*>&);
+  InvokeCallSiteSummariesAndDeadBlocks get_invoke_call_site_summaries(
+      DexMethod* caller,
+      const std::unordered_map<DexMethod*, size_t>& callees,
+      const ConstantEnvironment& initial_env);
 
   /**
    * Build up constant-arguments information for all invoked methods.
    */
-  void compute_callee_constant_arguments();
+  void compute_call_site_summaries();
 
   /**
-   * Initiate post-processing a method asynchronously.
+   * Initiate computation of various callee costs asynchronously.
    */
-  void async_postprocess_method(DexMethod* method);
+  void compute_callee_costs(DexMethod* method);
 
   /**
    * Post-processing a method synchronously.
@@ -422,31 +442,10 @@ class MultiMethodInliner {
   void shrink_method(DexMethod* method);
 
   /**
-   * For callers waiting for callees to become ready, decrement their wait
-   * counter, and if zero, initiate inlining and postprocessing.
-   */
-  void decrement_caller_wait_counts(const std::vector<DexMethod*>& callers);
-
-  /**
-   * If a callee has been registered for delayed shrinking, decrement the wait
-   * counter, and if zero, initiate shrinking asynchronously.
-   */
-  void decrement_delayed_shrinking_callee_wait_counts(
-      const std::vector<DexMethod*>& callees);
-
-  /**
    * Whether inline_inlinables needs to deconstruct the caller's and callees'
    * code.
    */
   bool inline_inlinables_need_deconstruct(DexMethod* method);
-
-  /**
-   * Execute asynchronously using a method's priority.
-   */
-  void async_prioritized_method_execute(DexMethod* method,
-                                        const std::function<void()>& f);
-
-  size_t get_same_method_implementations(const DexMethod* callee);
 
   // Checks that...
   // - there are no assignments to (non-inherited) instance fields before
@@ -472,65 +471,59 @@ class MultiMethodInliner {
   // Maps from callee to callers and reverse map from caller to callees.
   // Those are used to perform bottom up inlining.
   //
-  std::unordered_map<const DexMethod*, std::vector<DexMethod*>> callee_caller;
-  // this map is ordered in order that we inline our methods in a repeatable
-  // fashion so as to create reproducible binaries
-  std::unordered_map<DexMethod*, std::vector<DexMethod*>> caller_callee;
+  std::unordered_map<const DexMethod*, std::unordered_map<DexMethod*, size_t>>
+      callee_caller;
 
-  std::unordered_map<DexMethod*, std::unordered_map<IRInstruction*, DexMethod*>>
+  std::unordered_map<const DexMethod*, std::unordered_map<DexMethod*, size_t>>
+      caller_callee;
+
+  std::unordered_map<const DexMethod*,
+                     std::unordered_map<IRInstruction*, DexMethod*>>
       caller_virtual_callee;
 
-  // Cache of the inlined costs of each method after all its eligible callsites
-  // have been inlined.
-  mutable ConcurrentMap<const DexMethod*, boost::optional<InlinedCost>>
-      m_inlined_costs;
+  std::unordered_map<IRInstruction*, DexType*> m_inlined_invokes_need_cast;
+
+  std::unordered_set<const DexMethod*>
+      m_true_virtual_callees_with_other_call_sites;
+
+  std::unordered_set<const DexMethod*> m_recursive_callees;
+
+  // If mode == IntraDex, then this is the set of callees that is reachable via
+  // an (otherwise ignored) invocation from a caller in a different dex. If mode
+  // != IntraDex, then the set is empty.
+  std::unordered_set<const DexMethod*> m_x_dex_callees;
+
+  // Cache of the inlined costs of fully inlining a calle without using any
+  // summaries for pruning.
+  mutable ConcurrentMap<const DexMethod*, std::shared_ptr<InlinedCost>>
+      m_fully_inlined_costs;
+
+  // Cache of the average inlined costs of each method.
+  mutable ConcurrentMap<const DexMethod*, std::shared_ptr<InlinedCost>>
+      m_average_inlined_costs;
 
   // Cache of the inlined costs of each method and each constant-arguments key
-  // after all its eligible callsites have been inlined.
-  mutable ConcurrentMap<
-      const DexMethod*,
-      std::shared_ptr<std::unordered_map<std::string, InlinedCost>>>
-      m_inlined_costs_keyed;
+  // after pruning.
+  mutable ConcurrentMap<std::string, std::shared_ptr<InlinedCost>>
+      m_call_site_inlined_costs;
 
   /**
    * For all (reachable) invoked methods, list of constant arguments
    */
   mutable std::unordered_map<const DexMethod*,
-                             std::vector<ConstantArgumentsOccurrences>>
-      m_callee_constant_arguments;
+                             std::vector<CallSiteSummaryOccurrences>>
+      m_callee_call_site_summary_occurrences;
 
   /**
    * For all (reachable) invoke instructions, constant arguments
    */
-  mutable ConcurrentMap<const IRInstruction*, ConstantArguments>
-      m_call_constant_arguments;
+  mutable ConcurrentMap<const IRInstruction*, CallSiteSummary>
+      m_invoke_call_site_summaries;
 
   // Priority thread pool to handle parallel processing of methods, either
   // shrinking initially / after inlining into them, or even to inline in
   // parallel. By default, parallelism is disabled num_threads = 0).
-  PriorityThreadPool m_async_method_executor{0};
-
-  // For parallel execution, priorities for methods, to minimize waiting.
-  std::unordered_map<const DexMethod*, int> m_async_callee_priorities;
-
-  // For parallel execution, callee-callers relationships. The induced tree
-  // has been pruned of recursive relationships.
-  std::unordered_map<const DexMethod*, std::vector<DexMethod*>>
-      m_async_callee_callers;
-
-  // For parallel execution, caller-callees relationships. The induced tree
-  // has been pruned of recursive relationships.
-  std::unordered_map<const DexMethod*, std::vector<DexMethod*>>
-      m_async_caller_callees;
-
-  // For parallel execution, number of remaining callees any given caller is
-  // still waiting for.
-  ConcurrentMap<const DexMethod*, size_t> m_async_caller_wait_counts;
-
-  // For parallel execution, number of remaining callers any given delayed
-  // shrinking callee is still waiting for.
-  ConcurrentMap<const DexMethod*, size_t>
-      m_async_delayed_shrinking_callee_wait_counts;
+  PriorityThreadPoolDAGScheduler<DexMethod*> m_scheduler;
 
   // Set of methods that need to be made static eventually. The destructor
   // of this class will do the necessary delayed work.
@@ -577,7 +570,10 @@ class MultiMethodInliner {
     std::atomic<size_t> calls_inlined{0};
     std::atomic<size_t> calls_not_inlinable{0};
     std::atomic<size_t> calls_not_inlined{0};
+    std::atomic<size_t> no_returns{0};
+    std::atomic<size_t> unreachable_insns{0};
     std::atomic<size_t> intermediate_shrinkings{0};
+    std::atomic<size_t> intermediate_remove_unreachable_blocks{0};
     std::atomic<size_t> not_found{0};
     std::atomic<size_t> blocklisted{0};
     std::atomic<size_t> throws{0};
@@ -594,9 +590,14 @@ class MultiMethodInliner {
     std::atomic<size_t> cross_store{0};
     std::atomic<size_t> caller_too_large{0};
     std::atomic<size_t> constant_invoke_callers_analyzed{0};
+    std::atomic<size_t> constant_invoke_callers_unreachable{0};
+    std::atomic<size_t> constant_invoke_callers_incomplete{0};
     std::atomic<size_t> constant_invoke_callers_unreachable_blocks{0};
     std::atomic<size_t> constant_invoke_callees_analyzed{0};
     std::atomic<size_t> constant_invoke_callees_unreachable_blocks{0};
+    std::atomic<size_t> constant_invoke_callees_unused_results{0};
+    std::atomic<size_t> constant_invoke_callees_no_return{0};
+    std::atomic<size_t> constant_invoke_callers_critical_path_length{0};
   };
   InliningInfo info;
 
@@ -609,16 +610,18 @@ class MultiMethodInliner {
   // Non-const to allow for caching behavior.
   InlineForSpeed* m_inline_for_speed;
 
-  // Represents the size of the largest same-method-implementation group that a
-  // method belongs in; the default value is 1.
-  const std::unordered_map<const DexMethod*, size_t>*
-      m_same_method_implementations;
-
   // Whether to do some deep analysis to determine if constructor candidates
   // can be safely inlined, and don't inline them otherwise.
   bool m_analyze_and_prune_inits;
 
   shrinker::Shrinker m_shrinker;
+
+  AccumulatingTimer m_inline_callees_timer;
+  AccumulatingTimer m_inline_callees_should_inline_timer;
+  AccumulatingTimer m_inline_callees_init_timer;
+  AccumulatingTimer m_inline_inlinables_timer;
+  AccumulatingTimer m_inline_with_cfg_timer;
+  AccumulatingTimer m_call_site_inlined_cost_timer;
 
   const DexFieldRef* m_sdk_int_field =
       DexField::get_field("Landroid/os/Build$VERSION;.SDK_INT:I");
@@ -626,8 +629,29 @@ class MultiMethodInliner {
  public:
   const InliningInfo& get_info() { return info; }
 
-  size_t get_callers() { return m_async_caller_wait_counts.size(); }
-  size_t get_delayed_shrinking_callees() {
-    return m_async_delayed_shrinking_callee_wait_counts.size();
+  size_t get_callers() { return caller_callee.size(); }
+
+  size_t get_x_dex_callees() { return m_x_dex_callees.size(); }
+
+  double get_call_site_inlined_cost_seconds() const {
+    return m_call_site_inlined_cost_timer.get_seconds();
+  }
+  double get_inline_callees_seconds() const {
+    return m_inline_callees_timer.get_seconds() -
+           m_inline_callees_should_inline_timer.get_seconds() -
+           m_inline_callees_init_timer.get_seconds();
+  }
+  double get_inline_callees_should_inline_seconds() const {
+    return m_inline_callees_should_inline_timer.get_seconds();
+  }
+  double get_inline_callees_init_seconds() const {
+    return m_inline_callees_init_timer.get_seconds();
+  }
+  double get_inline_inlinables_seconds() const {
+    return m_inline_inlinables_timer.get_seconds() -
+           m_inline_with_cfg_timer.get_seconds();
+  }
+  double get_inline_with_cfg_seconds() const {
+    return m_inline_with_cfg_timer.get_seconds();
   }
 };

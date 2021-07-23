@@ -389,8 +389,9 @@ void OptDataMapper::serialize_method(
   meth_data["has_line_num"] = meth_opt_data->m_has_line_num ? 1 : 0;
   meth_data["line_num"] = (uint32_t)meth_opt_data->m_line_num;
   meth_data["signature"] = get_deobfuscated_name(method);
-  meth_data["code_size"] = (uint32_t)(
-      method->get_code() ? method->get_code()->sum_opcode_sizes() : 0);
+  meth_data["code_size"] =
+      (uint32_t)(method->get_code() ? method->get_code()->sum_opcode_sizes()
+                                    : 0);
   arr->append(meth_data);
   serialize_opt_nopt_helper(meth_opt_data->m_opts, meth_opt_data->m_nopts,
                             meth_id, opt_arr, nopt_arr);
@@ -453,8 +454,6 @@ void OptDataMapper::init_nopt_messages() {
        "virtual method"},
       {INL_UNKNOWN_FIELD,
        "Didn''t inline: callee references a field unknown to the caller"},
-      {INL_MULTIPLE_RETURNS,
-       "Didn''t inline: callee has multiple return points"},
       {INL_TOO_MANY_CALLERS,
        "Didn''t inline: this method has too many callers"},
       {INL_DO_NOT_INLINE, "Didn''t inline: the callee should not be inlined"}};

@@ -25,8 +25,10 @@ libredex_la_SOURCES = \
 	libredex/AnalysisUsage.cpp \
 	libredex/AnnoUtils.cpp \
 	libredex/ApiLevelChecker.cpp \
-	libredex/ApkManager.cpp \
+	libredex/ApkResources.cpp \
+	libredex/AssetManager.cpp \
 	libredex/BigBlocks.cpp \
+	libredex/BundleResources.cpp \
 	libredex/CFGMutation.cpp \
 	libredex/CallGraph.cpp \
 	libredex/ClassHierarchy.cpp \
@@ -126,6 +128,7 @@ libredex_la_SOURCES = \
 	libredex/ReflectionAnalysis.cpp \
 	libredex/RefChecker.cpp \
 	libredex/Resolver.cpp \
+	libredex/ScopedMetrics.cpp \
 	libredex/Show.cpp \
 	libredex/SourceBlocks.cpp \
 	libredex/Timer.cpp \
@@ -195,6 +198,7 @@ libredex_la_SOURCES = \
 	service/method-inliner/ConstructorAnalysis.cpp \
 	service/method-inliner/Deleter.cpp \
 	service/method-inliner/Inliner.cpp \
+	service/method-inliner/LegacyInliner.cpp \
 	service/method-inliner/MethodInliner.cpp \
 	service/method-inliner/ObjectInlinePlugin.cpp \
 	service/method-merger/MethodMerger.cpp \
@@ -207,6 +211,7 @@ libredex_la_SOURCES = \
 	service/regalloc/RegisterType.cpp \
 	service/regalloc/Split.cpp \
 	service/regalloc/VirtualRegistersFile.cpp \
+	service/regalloc-fast/LinearScan.cpp \
 	service/shrinker/Shrinker.cpp \
 	service/switch-dispatch/SwitchDispatch.cpp \
 	service/switch-partitioning/SwitchEquivFinder.cpp \
@@ -301,6 +306,7 @@ libopt_la_SOURCES = \
 	opt/print-members/PrintMembers.cpp \
 	opt/rebindrefs/ReBindRefs.cpp \
 	opt/regalloc/RegAlloc.cpp \
+	opt/regalloc-fast/FastRegAlloc.cpp \
 	opt/remove-apilevel-checks/RemoveApiLevelChecks.cpp \
 	opt/remove-builders/RemoveBuilders.cpp \
 	opt/remove-builders/RemoveBuildersHelper.cpp \
@@ -347,6 +353,7 @@ libopt_la_SOURCES = \
 	opt/test_cfg/TestCFG.cpp \
 	opt/track_resources/TrackResources.cpp \
 	opt/throw-propagation/ThrowPropagationPass.cpp \
+	opt/type-analysis/CallGraphFileGenerationPass.cpp \
 	opt/type-analysis/GlobalTypeAnalysisPass.cpp \
 	opt/type-analysis/TypeAnalysisCallGraphGenerationPass.cpp \
 	opt/unreferenced_interfaces/UnreferencedInterfaces.cpp \

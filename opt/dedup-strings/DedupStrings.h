@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "ABExperimentContext.h"
 #include "InterDexPass.h"
 #include "Pass.h"
 #include "PluginRegistry.h"
@@ -34,15 +35,19 @@ class DedupStrings {
 
   DedupStrings(size_t max_factory_methods,
                float method_profiles_appear_percent_threshold,
-               const method_profiles::MethodProfiles& method_profiles)
+               const method_profiles::MethodProfiles& method_profiles,
+               std::unordered_set<DexString*> ignore_strings = {})
       : m_max_factory_methods(max_factory_methods),
         m_method_profiles_appear_percent_threshold(
             method_profiles_appear_percent_threshold),
-        m_method_profiles(method_profiles) {}
+        m_method_profiles(method_profiles),
+        m_ignore_strings(std::move(ignore_strings)) {}
 
   const Stats& get_stats() const { return m_stats; }
 
-  void run(DexStoresVector& stores);
+  void run(
+      DexStoresVector& stores,
+      std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context);
 
  private:
   struct DedupStringInfo {
@@ -77,12 +82,14 @@ class DedupStrings {
       const Scope& scope,
       const std::unordered_map<const DexMethod*, size_t>& methods_to_dex,
       const std::unordered_set<const DexMethod*>& perf_sensitive_methods,
-      const std::unordered_map<DexString*, DedupStringInfo>& strings_to_dedup);
+      const std::unordered_map<DexString*, DedupStringInfo>& strings_to_dedup,
+      std::unique_ptr<ab_test::ABExperimentContext>& ab_experiment_context);
 
   mutable Stats m_stats;
   size_t m_max_factory_methods;
   float m_method_profiles_appear_percent_threshold;
   const method_profiles::MethodProfiles& m_method_profiles;
+  std::unordered_set<DexString*> m_ignore_strings;
 };
 
 /**

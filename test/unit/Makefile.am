@@ -48,6 +48,7 @@ check_PROGRAMS = \
     evaluate_type_checks_test \
     exception_test \
     extract_native_test \
+    fast_reg_alloc_test \
     fbjni_marker_test \
     final_inline_test \
     final_inline_v2_test \
@@ -55,6 +56,7 @@ check_PROGRAMS = \
     global_type_analysis_test \
     graph_util_test \
     hierarchy_util_test \
+    instruction_sequence_outliner_test \
     interprocedural_constant_propagation_test \
     intraprocedural_constant_propagation_test \
     ir_assembler_test \
@@ -117,6 +119,7 @@ check_PROGRAMS = \
     static_relo_v2_test \
     strip_debug_info_test \
     switch_dispatch_test \
+    switch_partitioning_test \
     timer_test \
     trace_multithreading_test \
     true_virtuals_test \
@@ -212,6 +215,8 @@ exception_test_SOURCES = RedexExceptionTest.cpp
 
 extract_native_test_SOURCES = ExtractNativeTest.cpp
 
+fast_reg_alloc_test_SOURCES = FastRegAllocTest.cpp
+
 fbjni_marker_test_SOURCES = FbjniMarkerTest.cpp
 
 final_inline_test_SOURCES = FinalInlineTest.cpp
@@ -226,6 +231,8 @@ graph_util_test_SOURCES = GraphUtilTest.cpp
 
 hierarchy_util_test_SOURCES = HierarchyUtilTest.cpp
 hierarchy_util_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
+
+instruction_sequence_outliner_test_SOURCES = InstructionSequenceOutlinerTest.cpp ScopeHelper.cpp
 
 interprocedural_constant_propagation_test_SOURCES = constant-propagation/IPConstantPropagationTest.cpp
 
@@ -375,6 +382,8 @@ strip_debug_info_test_SOURCES = StripDebugInfoTest.cpp
 
 switch_dispatch_test_SOURCES = SwitchDispatchTest.cpp
 
+switch_partitioning_test_SOURCES = SwitchPartitioningTest.cpp
+
 # throw_propagation_test_SOURCES = ThrowPropagationTest.cpp
 # throw_propagation_test_LDADD = $(COMMON_MOCK_TEST_LIBS)
 
@@ -455,12 +464,14 @@ TESTS = \
     evaluate_type_checks_test \
     exception_test \
     extract_native_test \
+    fast_reg_alloc_test \
     final_inline_test \
     final_inline_v2_test \
     fp_ev_test \
     global_type_analysis_test \
     graph_util_test \
     hierarchy_util_test \
+    instruction_sequence_outliner_test \
     interprocedural_constant_propagation_test \
     intraprocedural_constant_propagation_test \
     ir_assembler_test \
@@ -521,6 +532,7 @@ TESTS = \
     static_relo_v2_test \
     strip_debug_info_test \
     switch_dispatch_test \
+    switch_partitioning_test \
     timer_test \
     trace_multithreading_test \
     true_virtuals_test \

@@ -12,6 +12,7 @@
 #include "DexClass.h"
 #include "DexUtil.h"
 #include "KotlinNullCheckMethods.h"
+#include "LiveRange.h"
 #include "PassManager.h"
 #include "ReachingDefinitions.h"
 #include "Show.h"
@@ -266,6 +267,9 @@ RemoveNullcheckStringArg::Stats RemoveNullcheckStringArg::change_in_cfg(
     param_index.insert(std::make_pair(load_insn->dest(), arg_index++));
   }
 
+  live_range::MoveAwareChains chains(cfg);
+  live_range::DefUseChains du_chains = chains.get_def_use_chains();
+
   for (cfg::Block* block : cfg.blocks()) {
     auto env = reaching_defs_iter.get_entry_state_at(block);
     if (env.is_bottom()) {
@@ -287,14 +291,36 @@ RemoveNullcheckStringArg::Stats RemoveNullcheckStringArg::change_in_cfg(
         // We could have params copied via intermediate registers.
         auto defs = env.get(insn->src(0));
         always_assert(!defs.is_bottom() && !defs.is_top());
-        always_assert(defs.elements().size() == 1);
-        auto def = *defs.elements().begin();
-        auto def_op = def->opcode();
-        always_assert(def_op == IOPCODE_LOAD_PARAM ||
-                      def_op == IOPCODE_LOAD_PARAM_OBJECT ||
-                      def_op == IOPCODE_LOAD_PARAM_OBJECT);
-        auto param_iter = param_index.find(def->dest());
+        IRInstruction* param_load_insn = nullptr;
+        for (auto* def : defs.elements()) {
+          if (!opcode::is_a_load_param(def->opcode())) {
+            continue;
+          }
+          if (param_load_insn) {
+            /* Multiple param load insns. Should never happen.*/
+            param_load_insn = nullptr;
+            break;
+          }
+          param_load_insn = def;
+        }
+        if (!param_load_insn) {
+          /* No param load insn. Should never happen. In any case, skipping this
+           * insn is OK. */
+          continue;
+        }
+        auto param_iter = param_index.find(param_load_insn->dest());
         always_assert(param_iter != param_index.end());
+
+        auto use_set = du_chains[param_load_insn];
+        if (use_set.size() == 1) {
+          for (const auto& p : use_set) {
+            always_assert(p.insn == insn);
+          }
+          // If we have single use which is null check, remove null check.
+          m.remove(cfg.find_insn(insn));
+          continue;
+        }
+
         auto index = param_iter->second;
         auto tmp_reg = cfg.allocate_temp();
         IRInstruction* cst_insn = new IRInstruction(OPCODE_CONST);

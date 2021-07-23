@@ -21,6 +21,7 @@ check_PROGRAMS = \
     dedup_blocks_test \
     dedup_vmethods_test \
     default_annotation_test \
+    dex_output_test \
     final_inline_analysis_test \
     global_type_analysis_test \
     instruction_sequence_outliner_test \
@@ -40,7 +41,8 @@ check_PROGRAMS = \
     strip_debug_info_test \
     synth_test \
     type_analysis_transform_test \
-    type_inference_test
+    type_inference_test \
+    verifier_artifacts_test
 
 TESTS = $(check_PROGRAMS)
 
@@ -70,6 +72,9 @@ EXTRA_dedup_vmethods_test_DEPENDENCIES = dedup_vmethods_test-class.dex
 
 default_annotation_test_SOURCES = DefaultAnnotation.cpp
 EXTRA_default_annotation_test_DEPENDENCIES = default_annotation_test-class.dex
+
+dex_output_test_SOURCES = DexOutputTest.cpp
+EXTRA_dex_output_test_DEPENDENCIES = dex_output_test-class.dex
 
 final_inline_analysis_test_SOURCES = FinalInlineAnalysisTest.cpp
 EXTRA_final_inline_analysis_test_DEPENDENCIES = final_inline_analysis_test-class.dex
@@ -134,6 +139,9 @@ EXTRA_type_analysis_transform_test_DEPENDENCIES = type_analysis_transform_test-c
 type_inference_test_SOURCES = TypeInferenceTest.cpp
 EXTRA_type_inference_test_DEPENDENCIES = type_inference_test-class.dex
 
+verifier_artifacts_test_SOURCES = VerifierTest.cpp
+EXTRA_verifier_artifacts_test_DEPENDENCIES = verifier_artifacts_test-class.dex
+
 # Note: Should switch to d8, instead.
 javac_source_target = -source 1.7 -target 1.7
 
@@ -173,6 +181,9 @@ dedup_vmethods_test-class.jar: DedupVirtualMethodsTest.java
 	$(create_jar)
 
 default_annotation_test-class.jar: DefaultAnnotationTest.java
+	$(create_jar)
+
+dex_output_test-class.jar: DexOutputTest.java
 	$(create_jar)
 
 final_inline_analysis_test-class.jar: FinalInlineAnalysisTest.java
@@ -233,4 +244,7 @@ type_analysis_transform_test-class.jar: TypeAnalysisTransformTest.java
 	$(create_jar)
 
 type_inference_test-class.jar: TypeInferenceTest.java
+	$(create_jar)
+
+verifier_artifacts_test-class.jar: VerifierTest.java
 	$(create_jar)

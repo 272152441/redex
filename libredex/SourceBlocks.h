@@ -141,12 +141,21 @@ struct InsertResult {
   bool profile_success;
 };
 
-InsertResult insert_source_blocks(
-    DexMethod* method,
-    ControlFlowGraph* cfg,
-    const std::vector<boost::optional<std::string>>& profiles = {},
-    bool serialize = true,
-    bool insert_after_excs = false);
+// Source data for a profile = interaction. Three options per interactions:
+// * Nothing (std::nullopt)
+// * A string that denotes a serialized profile, and an error value, in case
+//   the profile does nto match the CFG.
+// * A general default value.
+using ProfileData =
+    std::variant<std::nullopt_t,
+                 std::pair<std::string, boost::optional<SourceBlock::Val>>,
+                 SourceBlock::Val>;
+
+InsertResult insert_source_blocks(DexMethod* method,
+                                  ControlFlowGraph* cfg,
+                                  const std::vector<ProfileData>& profiles = {},
+                                  bool serialize = true,
+                                  bool insert_after_excs = false);
 
 inline bool has_source_blocks(const cfg::Block* b) {
   for (const auto& mie : *b) {
@@ -190,7 +199,9 @@ inline void foreach_source_block(cfg::Block* b, const Fn& fn) {
     if (mie.type != MFLOW_SOURCE_BLOCK) {
       continue;
     }
-    fn(mie.src_block.get());
+    for (auto* sb = mie.src_block.get(); sb != nullptr; sb = sb->next.get()) {
+      fn(sb);
+    }
   }
 }
 template <typename Fn>
@@ -199,7 +210,9 @@ inline void foreach_source_block(const cfg::Block* b, const Fn& fn) {
     if (mie.type != MFLOW_SOURCE_BLOCK) {
       continue;
     }
-    fn(mie.src_block.get());
+    for (auto* sb = mie.src_block.get(); sb != nullptr; sb = sb->next.get()) {
+      fn(sb);
+    }
   }
 }
 

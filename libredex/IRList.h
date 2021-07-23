@@ -185,6 +185,23 @@ struct SourceBlock {
     return vals[i] ? boost::optional<float>(vals[i]->appear100) : boost::none;
   }
 
+  template <typename Fn>
+  void foreach_val(const Fn& fn) const {
+    for (const auto& val : vals) {
+      fn(val);
+    }
+  }
+
+  template <typename Fn>
+  bool foreach_val_early(const Fn& fn) const {
+    for (const auto& val : vals) {
+      if (fn(val)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool operator==(const SourceBlock& other) const {
     return src == other.src && id == other.id && vals == other.vals;
   }
@@ -522,8 +539,6 @@ class IRList {
   IRList::const_iterator iterator_to(const MethodItemEntry& mie) const {
     return m_list.iterator_to(mie);
   }
-
-  IRList::difference_type index_of(const MethodItemEntry& mie) const;
 
   friend std::string show(const IRCode*);
 };

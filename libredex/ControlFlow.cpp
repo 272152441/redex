@@ -894,7 +894,10 @@ void chain_consecutive_source_blocks(IRList& list) {
 } // namespace
 
 void ControlFlowGraph::simplify() {
-  remove_unreachable_blocks();
+  auto registers_size_possibly_reduced = remove_unreachable_blocks().second;
+  if (registers_size_possibly_reduced) {
+    recompute_registers_size();
+  }
   // FIXME: "Empty" blocks with only `DexPosition`s should be merged
   //        into their successors for consistency. Otherwise
   //        `remove_empty_blocks` will remove them, which it will not
@@ -907,11 +910,11 @@ void ControlFlowGraph::simplify() {
 }
 
 // remove blocks with no predecessors
-uint32_t ControlFlowGraph::remove_unreachable_blocks() {
+std::pair<uint32_t, bool> ControlFlowGraph::remove_unreachable_blocks() {
   uint32_t num_insns_removed = 0;
   remove_unreachable_succ_edges();
   std::vector<std::unique_ptr<DexPosition>> dangling;
-  bool need_register_size_fix = false;
+  bool registers_size_possibly_reduced = false;
   for (auto it = m_blocks.begin(); it != m_blocks.end();) {
     Block* b = it->second;
     const auto& preds = b->preds();
@@ -927,7 +930,7 @@ uint32_t ControlFlowGraph::remove_unreachable_blocks() {
             if (size_required >= m_registers_size) {
               // We're deleting an instruction that may have been the max
               // register of the entire function.
-              need_register_size_fix = true;
+              registers_size_possibly_reduced = true;
             }
           }
         }
@@ -945,12 +948,9 @@ uint32_t ControlFlowGraph::remove_unreachable_blocks() {
     }
   }
 
-  if (need_register_size_fix) {
-    recompute_registers_size();
-  }
   fix_dangling_parents(std::move(dangling));
 
-  return num_insns_removed;
+  return std::make_pair(num_insns_removed, registers_size_possibly_reduced);
 }
 
 void ControlFlowGraph::fix_dangling_parents(
@@ -2588,8 +2588,9 @@ bool ControlFlowGraph::push_back(Block* b, IRInstruction* insn) {
   return push_back(b, std::vector<IRInstruction*>{insn});
 }
 
-void ControlFlowGraph::remove_blocks(const std::vector<Block*>& blocks) {
+uint32_t ControlFlowGraph::remove_blocks(const std::vector<Block*>& blocks) {
   std::vector<std::unique_ptr<DexPosition>> dangling;
+  uint32_t insns_removed = 0;
 
   for (auto block : blocks) {
     if (block == entry_block()) {
@@ -2600,7 +2601,9 @@ void ControlFlowGraph::remove_blocks(const std::vector<Block*>& blocks) {
     delete_succ_edges(block);
 
     for (auto& mie : *block) {
-      if (mie.type == MFLOW_POSITION) {
+      if (mie.type == MFLOW_OPCODE) {
+        insns_removed++;
+      } else if (mie.type == MFLOW_POSITION) {
         dangling.push_back(std::move(mie.pos));
       }
     }
@@ -2614,10 +2617,11 @@ void ControlFlowGraph::remove_blocks(const std::vector<Block*>& blocks) {
   }
 
   fix_dangling_parents(std::move(dangling));
+  return insns_removed;
 }
 
 // delete old_block and reroute its predecessors to new_block
-void ControlFlowGraph::replace_blocks(
+uint32_t ControlFlowGraph::replace_blocks(
     const std::vector<std::pair<Block*, Block*>>& old_new_blocks) {
   std::vector<Block*> blocks_to_remove;
   for (auto& p : old_new_blocks) {
@@ -2629,7 +2633,7 @@ void ControlFlowGraph::replace_blocks(
     }
     blocks_to_remove.push_back(old_block);
   }
-  remove_blocks(blocks_to_remove);
+  return remove_blocks(blocks_to_remove);
 }
 
 std::ostream& ControlFlowGraph::write_dot_format(std::ostream& o) const {
@@ -2705,6 +2709,56 @@ DexPosition* ControlFlowGraph::get_dbg_pos(const cfg::InstructionIterator& it) {
     return nullptr;
   };
   return check_prev_block(it.block());
+}
+
+} // namespace cfg
+
+namespace {
+template <typename InternalIterator>
+class IteratorMapper {
+ public:
+  using difference_type = IROpcode;
+  using value_type = IROpcode;
+  using pointer = IROpcode*;
+  using reference = IROpcode&;
+  using iterator_category = std::random_access_iterator_tag;
+
+  explicit IteratorMapper(const InternalIterator& it) : m_internal_it(it) {}
+  IteratorMapper(const IteratorMapper<InternalIterator>& other)
+      : m_internal_it(other.m_internal_it) {}
+  ~IteratorMapper() {}
+  IteratorMapper& operator=(const IteratorMapper<InternalIterator>& other) {
+    m_internal_it = other.m_internal_it;
+    return *this;
+  }
+
+  IteratorMapper& operator++() {
+    m_internal_it++;
+    return *this;
+  }
+
+  bool operator!=(const IteratorMapper<InternalIterator>& other) {
+    return m_internal_it != other.m_internal_it;
+  }
+
+  IROpcode& operator*() {
+    m_opcode = m_internal_it->insn->opcode();
+    return m_opcode;
+  }
+
+ private:
+  InternalIterator m_internal_it;
+  IROpcode m_opcode;
+};
+
+} // namespace
+
+namespace cfg {
+
+std::size_t ControlFlowGraph::opcode_hash() const {
+  auto ii = cfg::ConstInstructionIterable(*this);
+  return boost::hash_range(IteratorMapper(ii.begin()),
+                           IteratorMapper(ii.end()));
 }
 
 } // namespace cfg

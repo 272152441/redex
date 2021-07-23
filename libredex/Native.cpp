@@ -53,6 +53,13 @@ void get_compilation_units_impl(
     return;
   }
 
+  if (fs::is_regular_file(path / "registered_natives.json")) {
+    // We found a compilation unit.
+    compilation_units.emplace(location_prefix,
+                              CompilationUnit{location_prefix, path});
+    return;
+  }
+
   std::string separator = location_prefix.empty() ? "" : "/";
 
   for (const auto& item : fs::directory_iterator(path)) {
@@ -74,19 +81,19 @@ void CompilationUnit::populate_functions(
   auto jni_json_path = (m_infodir_path / "jni.json").string();
   auto jni_json_opt = read_json_from_file(jni_json_path);
 
-  always_assert_log(jni_json_opt, "Cannot find file %s", jni_json_path.c_str());
-
-  for (Json::Value::ArrayIndex i = 0; i < jni_json_opt->size(); i++) {
-    std::string function_name = (*jni_json_opt)[i].asString();
-    auto decl_it = expected_names_to_decl.find(function_name);
-    DexMethod* decl =
-        decl_it == expected_names_to_decl.end() ? nullptr : decl_it->second;
-    m_name_to_functions.emplace(function_name,
-                                Function{this, function_name, decl});
+  if (jni_json_opt) {
+    for (Json::Value::ArrayIndex i = 0; i < jni_json_opt->size(); i++) {
+      std::string function_name = (*jni_json_opt)[i].asString();
+      auto decl_it = expected_names_to_decl.find(function_name);
+      DexMethod* decl =
+          decl_it == expected_names_to_decl.end() ? nullptr : decl_it->second;
+      m_name_to_functions.emplace(function_name,
+                                  Function{this, function_name, decl});
+    }
   }
 
-  // Alternatively, native methods can be registered with RegisterNatives calls.
-  // Use specific analyses to extract information.
+  // Alternatively, native methods can be registered with RegisterNatives
+  // calls. Use specific analyses to extract information.
 
   auto registered_natives_path =
       (m_infodir_path / "registered_natives.json").string();
@@ -158,11 +165,9 @@ NativeContext NativeContext::build(const std::string& path_to_native_results,
     for (auto& [fn_name, function] : unit.get_functions()) {
       auto java_declarations = function.get_java_declarations();
       for (DexMethod* java_declaration : java_declarations) {
-        always_assert_log(
-            ret.java_declaration_to_function.count(java_declaration) == 0,
-            "More than one implementation for native Java method {%s}!",
-            SHOW(java_declaration));
-        ret.java_declaration_to_function[java_declaration] = &function;
+        if (ret.java_declaration_to_function.count(java_declaration) == 0) {
+          ret.java_declaration_to_function[java_declaration] = &function;
+        }
       }
     }
   }

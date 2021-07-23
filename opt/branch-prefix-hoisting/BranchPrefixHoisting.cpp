@@ -391,8 +391,13 @@ size_t hoist_insns_for_block(cfg::Block* block,
     return ret;
   }();
 
+  const bool any_throw = std::any_of(
+      insns_to_hoist.begin(), insns_to_hoist.end(),
+      [](const auto& insn) { return opcode::can_throw(insn.opcode()); });
+
+  DexPosition* last_position = nullptr;
   for (const auto& insn : insns_to_hoist) {
-    // Check if any source blocks precede instructions.
+    // Check if any source blocks or positions precede instructions.
     if (!opcode::is_move_result_any(insn.opcode())) {
       for (auto& p : succs) {
         auto* b = p.first;
@@ -404,18 +409,59 @@ size_t hoist_insns_for_block(cfg::Block* block,
           if (it->type == MFLOW_OPCODE) {
             break;
           }
-          // Leave position and debug in the block.
-          if (it->type == MFLOW_DEBUG || it->type == MFLOW_POSITION) {
+          // Leave debug in the block.
+          if (it->type == MFLOW_DEBUG) {
             continue;
           }
-          // Hoist source blocks.
+          // Hoist source blocks and clone positions.
           // TODO: Collapse equivalent source blocks?
-          redex_assert(it->type == MFLOW_SOURCE_BLOCK);
-          cfg.insert_before(insert_it, std::move(it->src_block));
-          b->remove_mie(it);
+          // TODO: Deal with duplication.
+          switch (it->type) {
+          case MFLOW_SOURCE_BLOCK:
+            // The situation is complicated (besides not tracking control flow
+            // correctly, being approximative), as inlining may have produced
+            // straight code where avoiding that duplication is not obvious. For
+            // example:
+            //
+            // SB1 - NT1 - T1 - SB2 - NT2 | T2 - SB3
+            //
+            // In this case, it would be best to leave SB2 in the block, as it
+            // gives better information than SB3 (or may be necessary to have
+            // any SB in the remaining block!).
+            //
+            // For simplicity, if any instruction to hoist throws, we *copy*
+            // *all* source blocks we encounter. This will duplicate every SB,
+            // but avoids complicated tracking of what to hoist, clone, or leave
+            // alone. Duplication is not an issue for coverage profiling, but
+            // for counting.
+            // TODO: Revisit.
+            //
+            // If all hoisted instructions do not throw, just move the
+            // instructions. It is safe to do so, as no "additional" control
+            // flow is being introduced, such that the SBs in the old block will
+            // give the precise information.
+            if (any_throw) {
+              cfg.insert_before(insert_it,
+                                std::make_unique<SourceBlock>(*it->src_block));
+            }
+            break;
+          case MFLOW_POSITION:
+            last_position = it->pos.get();
+            break;
+          default:
+            not_reached();
+          }
         }
         redex_assert(it != b->end());
       }
+    }
+
+    if (opcode::may_throw(insn.opcode()) && last_position) {
+      // We clone positions instead of moving, so that we don't move away
+      // any initial positions from the sacrificial block. In case of
+      // adjacent positions, the cfg will clean up obvious redundancy.
+      cfg.insert_before(insert_it,
+                        std::make_unique<DexPosition>(*last_position));
     }
 
     // Insert instruction.
@@ -450,7 +496,8 @@ size_t hoist_insns_for_block(cfg::Block* block,
   for (const auto& p : succs) {
     const auto& end = p.second;
     for (auto it = p.first->begin(); it != end; ++it) {
-      redex_assert(it->type == MFLOW_DEBUG || it->type == MFLOW_POSITION);
+      redex_assert(it->type == MFLOW_DEBUG || it->type == MFLOW_POSITION ||
+                   it->type == MFLOW_SOURCE_BLOCK);
     }
   }
 
@@ -463,12 +510,9 @@ size_t process_hoisting_for_block(cfg::Block* block,
                                   type_inference::TypeInference& type_inference,
                                   constant_uses::ConstantUses& constant_uses) {
 
-  auto all_preds_are_same = [](const std::vector<cfg::Edge*>& edge_lst) {
-    if (edge_lst.size() == 1) {
-      return true;
-    }
-    std::set<cfg::Block*> count;
-    for (auto e : edge_lst) {
+  auto all_preds_are_same = [](const std::vector<cfg::Edge*>& edges) {
+    std::unordered_set<cfg::Block*> count;
+    for (auto e : edges) {
       count.insert(e->src());
     }
     return count.size() == 1;
@@ -497,11 +541,15 @@ size_t process_hoisting_for_block(cfg::Block* block,
   }
 
   std::vector<cfg::Block*> succ_blocks = get_succ_blocks(block);
-  // make sure every successor has same predecessor
+  // make sure every successor has same predecessor and none will have to throw.
   for (auto succ_block : succ_blocks) {
     const auto& preds_of_succ_block = succ_block->preds();
     if (!all_preds_are_same(preds_of_succ_block)) {
       // we can only hoist the prefix if the block has only one incoming edge
+      return 0;
+    }
+
+    if (cfg.get_succ_edge_of_type(succ_block, cfg::EDGE_THROW)) {
       return 0;
     }
   }

@@ -245,12 +245,12 @@ bool is_trivial_builder_constructor(DexMethod* method) {
   return it == ii.end();
 }
 
-std::vector<DexMethod*> get_non_trivial_init_methods(IRCode* code,
-                                                     DexType* type) {
+std::unordered_set<DexMethod*> get_non_trivial_init_methods(IRCode* code,
+                                                            DexType* type) {
   always_assert(code != nullptr);
   always_assert(type != nullptr);
 
-  std::vector<DexMethod*> methods;
+  std::unordered_set<DexMethod*> methods;
   for (auto const& mie : InstructionIterable(code)) {
     auto insn = mie.insn;
     if (opcode::is_an_invoke(insn->opcode())) {
@@ -258,7 +258,7 @@ std::vector<DexMethod*> get_non_trivial_init_methods(IRCode* code,
       if (invoked != nullptr && invoked->get_class() == type) {
         if (method::is_constructor(invoked) &&
             !is_trivial_builder_constructor(invoked)) {
-          methods.emplace_back(invoked);
+          methods.insert(invoked);
         }
       }
     }
@@ -879,7 +879,7 @@ bool update_buildee_constructor(DexMethod* method, DexClass* builder) {
       auto fields = builder->get_ifields();
       insn->set_method(fields_constr);
       // 'Make room' for the reg arguments.
-      insn->set_srcs_size(2 * fields.size() + 1);
+      insn->set_srcs_size(fields.size() + 1);
 
       // Loading each of the fields before passing them to the method.
       // `invoke-direct {v_class, v_builder}` ->
@@ -897,12 +897,10 @@ bool update_buildee_constructor(DexMethod* method, DexClass* builder) {
             new IRInstruction(IOPCODE_MOVE_RESULT_PSEUDO_OBJECT);
         move_result_pseudo->set_dest(new_regs_size);
         code->insert_before(it, move_result_pseudo);
-
         insn->set_src(index++, new_regs_size);
         new_regs_size += type::is_wide_type(field->get_type()) ? 2 : 1;
       }
 
-      insn->set_srcs_size(new_regs_size - regs_size + 1);
       code->set_registers_size(new_regs_size);
     }
   }
@@ -1118,17 +1116,17 @@ DexType* get_buildee(DexType* builder) {
   return DexType::get_type(buildee_name.c_str());
 }
 
-std::vector<DexMethod*> get_all_methods(IRCode* code, DexType* type) {
+std::unordered_set<DexMethod*> get_all_methods(IRCode* code, DexType* type) {
   always_assert(code != nullptr);
   always_assert(type != nullptr);
 
-  std::vector<DexMethod*> methods;
+  std::unordered_set<DexMethod*> methods;
   for (auto const& mie : InstructionIterable(code)) {
     auto insn = mie.insn;
     if (opcode::is_an_invoke(insn->opcode())) {
       auto invoked = resolve_method(insn->get_method(), opcode_to_search(insn));
       if (invoked != nullptr && invoked->get_class() == type) {
-        methods.emplace_back(invoked);
+        methods.insert(invoked);
       }
     }
   }
@@ -1136,20 +1134,23 @@ std::vector<DexMethod*> get_all_methods(IRCode* code, DexType* type) {
   return methods;
 }
 
-std::vector<DexMethod*> get_non_init_methods(IRCode* code, DexType* type) {
-  std::vector<DexMethod*> methods = get_all_methods(code, type);
-  methods.erase(remove_if(methods.begin(),
-                          methods.end(),
-                          [&](DexMethod* m) { return method::is_init(m); }),
-                methods.end());
-
+std::unordered_set<DexMethod*> get_non_init_methods(IRCode* code,
+                                                    DexType* type) {
+  std::unordered_set<DexMethod*> methods = get_all_methods(code, type);
+  for (auto it = methods.begin(); it != methods.end();) {
+    if (method::is_init(*it)) {
+      it = methods.erase(it);
+    } else {
+      it++;
+    }
+  }
   return methods;
 }
 
 bool BuilderTransform::inline_methods(
     DexMethod* method,
     DexType* type,
-    const std::function<std::vector<DexMethod*>(IRCode*, DexType*)>&
+    const std::function<std::unordered_set<DexMethod*>(IRCode*, DexType*)>&
         get_methods_to_inline) {
   always_assert(method != nullptr);
   always_assert(type != nullptr);
@@ -1159,10 +1160,8 @@ bool BuilderTransform::inline_methods(
     return false;
   }
 
-  std::vector<DexMethod*> previous_to_inline;
-  std::vector<DexMethod*> to_inline = get_methods_to_inline(code, type);
-  // TODO: This is a temporary fix, we should fix inliner T52618040
-  std::sort(to_inline.begin(), to_inline.end(), compare_dexmethods);
+  std::unordered_set<DexMethod*> previous_to_inline;
+  std::unordered_set<DexMethod*> to_inline = get_methods_to_inline(code, type);
 
   while (!to_inline.empty()) {
 
@@ -1182,8 +1181,6 @@ bool BuilderTransform::inline_methods(
     // Check all possible methods were inlined.
     previous_to_inline = to_inline;
     to_inline = get_methods_to_inline(code, type);
-    // TODO: This is a temporary fix, we should fix inliner T52618040
-    std::sort(to_inline.begin(), to_inline.end(), compare_dexmethods);
 
     // Return false if  nothing changed / nothing got inlined though
     // there were methods to inline.

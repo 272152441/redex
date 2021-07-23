@@ -23,6 +23,7 @@
 #include "PassManager.h"
 #include "Purity.h"
 #include "Resolver.h"
+#include "Shrinker.h"
 #include "Timer.h"
 #include "Trace.h"
 #include "TypeSystem.h"
@@ -411,9 +412,10 @@ StaticFieldReadAnalysis::Result StaticFieldReadAnalysis::analyze(
 cp::WholeProgramState analyze_and_simplify_clinits(
     const Scope& scope,
     const XStoreRefs* xstores,
+    const std::unordered_set<const DexType*>& blocklist_types,
     const std::unordered_set<std::string>& allowed_opaque_callee_names) {
   const std::unordered_set<DexMethodRef*> pure_methods = get_pure_methods();
-  cp::WholeProgramState wps;
+  cp::WholeProgramState wps(blocklist_types);
 
   auto method_override_graph = method_override_graph::build_graph(scope);
   auto graph =
@@ -481,9 +483,10 @@ cp::WholeProgramState analyze_and_simplify_clinits(
 cp::WholeProgramState analyze_and_simplify_inits(
     const Scope& scope,
     const XStoreRefs* xstores,
+    const std::unordered_set<const DexType*>& blocklist_types,
     const cp::EligibleIfields& eligible_ifields) {
   const std::unordered_set<DexMethodRef*> pure_methods = get_pure_methods();
-  cp::WholeProgramState wps;
+  cp::WholeProgramState wps(blocklist_types);
   for (DexClass* cls : reverse_tsort_by_init_deps(scope)) {
     if (cls->is_external()) {
       continue;
@@ -887,13 +890,27 @@ cp::EligibleIfields gather_ifield_candidates(
 }
 
 size_t inline_final_gets(
+    std::optional<DexStoresVector*> stores,
     const Scope& scope,
     const XStoreRefs* xstores,
     const cp::WholeProgramState& wps,
     const std::unordered_set<const DexType*>& blocklist_types,
     cp::FieldType field_type) {
-  size_t inlined_count{0};
-  walk::code(scope, [&](const DexMethod* method, IRCode& code) {
+  std::atomic<size_t> inlined_count{0};
+  using namespace shrinker;
+
+  ShrinkerConfig shrinker_config;
+  shrinker_config.run_const_prop = true;
+  shrinker_config.run_cse = true;
+  shrinker_config.run_copy_prop = true;
+  shrinker_config.run_local_dce = true;
+  shrinker_config.compute_pure_methods = false;
+
+  auto maybe_shrinker =
+      stores ? std::make_optional<Shrinker>(**stores, scope, shrinker_config)
+             : std::nullopt;
+
+  walk::parallel::code(scope, [&](DexMethod* method, IRCode& code) {
     if (field_type == cp::FieldType::STATIC && method::is_clinit(method)) {
       return;
     }
@@ -928,7 +945,13 @@ size_t inline_final_gets(
     for (auto const& p : replacements) {
       code.replace_opcode(p.first, p.second);
     }
-    inlined_count += replacements.size();
+    if (!replacements.empty() && maybe_shrinker) {
+      // We need to rebuild the cfg.
+      code.build_cfg(/* editable */);
+      code.clear_cfg();
+      maybe_shrinker->shrink_method(method);
+    }
+    inlined_count.fetch_add(replacements.size());
   });
   return inlined_count;
 }
@@ -937,11 +960,13 @@ size_t inline_final_gets(
 
 size_t FinalInlinePassV2::run(const Scope& scope,
                               const XStoreRefs* xstores,
-                              const Config& config) {
+                              const Config& config,
+                              std::optional<DexStoresVector*> stores) {
   try {
-    auto wps = final_inline::analyze_and_simplify_clinits(scope, xstores);
-    return inline_final_gets(scope, xstores, wps, config.blocklist_types,
-                             cp::FieldType::STATIC);
+    auto wps = final_inline::analyze_and_simplify_clinits(
+        scope, xstores, config.blocklist_types);
+    return inline_final_gets(stores, scope, xstores, wps,
+                             config.blocklist_types, cp::FieldType::STATIC);
   } catch (final_inline::class_initialization_cycle& e) {
     std::cerr << e.what();
     return 0;
@@ -952,10 +977,11 @@ size_t FinalInlinePassV2::run_inline_ifields(
     const Scope& scope,
     const XStoreRefs* xstores,
     const cp::EligibleIfields& eligible_ifields,
-    const Config& config) {
-  auto wps = final_inline::analyze_and_simplify_inits(scope, xstores,
-                                                      eligible_ifields);
-  return inline_final_gets(scope, xstores, wps, config.blocklist_types,
+    const Config& config,
+    std::optional<DexStoresVector*> stores) {
+  auto wps = final_inline::analyze_and_simplify_inits(
+      scope, xstores, config.blocklist_types, eligible_ifields);
+  return inline_final_gets(stores, scope, xstores, wps, config.blocklist_types,
                            cp::FieldType::INSTANCE);
 }
 
@@ -971,13 +997,13 @@ void FinalInlinePassV2::run_pass(DexStoresVector& stores,
   }
   auto scope = build_class_scope(stores);
   XStoreRefs xstores(stores);
-  auto inlined_sfields_count = run(scope, &xstores, m_config);
+  auto inlined_sfields_count = run(scope, &xstores, m_config, &stores);
   size_t inlined_ifields_count{0};
   if (m_config.inline_instance_field) {
     cp::EligibleIfields eligible_ifields =
         gather_ifield_candidates(scope, m_config.allowlist_method_names);
-    inlined_ifields_count =
-        run_inline_ifields(scope, &xstores, eligible_ifields, m_config);
+    inlined_ifields_count = run_inline_ifields(
+        scope, &xstores, eligible_ifields, m_config, &stores);
   }
   mgr.incr_metric("num_static_finals_inlined", inlined_sfields_count);
   mgr.incr_metric("num_instance_finals_inlined", inlined_ifields_count);

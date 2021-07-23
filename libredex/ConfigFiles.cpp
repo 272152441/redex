@@ -7,6 +7,7 @@
 
 #include "ConfigFiles.h"
 
+#include <boost/filesystem.hpp>
 #include <fstream>
 #include <iostream>
 #include <json/json.h>
@@ -25,7 +26,8 @@ ConfigFiles::ConfigFiles(const Json::Value& config, const std::string& outdir)
       outdir(outdir),
       m_global_config(GlobalConfig::default_registry()),
       m_proguard_map(
-          new ProguardMap(config.get("proguard_map", "").asString())),
+          new ProguardMap(config.get("proguard_map", "").asString(),
+                          config.get("use_new_rename_map", 0).asBool())),
       m_printseeds(config.get("printseeds", "").asString()),
       m_method_profiles(new method_profiles::MethodProfiles()) {
 
@@ -213,25 +215,23 @@ void ConfigFiles::load_inliner_config(inliner::InlinerConfig* inliner_config) {
   jw.get("virtual", true, inliner_config->virtual_inline);
   jw.get("true_virtual_inline", false, inliner_config->true_virtual_inline);
   jw.get("throws", false, inliner_config->throws_inline);
+  jw.get("throw_after_no_return", false, inliner_config->throw_after_no_return);
   jw.get("enforce_method_size_limit",
          true,
          inliner_config->enforce_method_size_limit);
-  jw.get(
-      "use_constant_propagation_and_local_dce_for_callee_size", true,
-      inliner_config->use_constant_propagation_and_local_dce_for_callee_size);
-  jw.get("use_cfg_inliner", true, inliner_config->use_cfg_inliner);
+  jw.get("use_call_site_summaries", true,
+         inliner_config->use_call_site_summaries);
   jw.get("intermediate_shrinking", false,
          inliner_config->intermediate_shrinking);
   jw.get("multiple_callers", false, inliner_config->multiple_callers);
-  jw.get("inline_small_non_deletables",
-         true,
-         inliner_config->inline_small_non_deletables);
+  jw.get("delete_any_candidate", false, inliner_config->delete_any_candidate);
   auto& shrinker_config = inliner_config->shrinker;
   jw.get("run_const_prop", false, shrinker_config.run_const_prop);
   jw.get("run_cse", false, shrinker_config.run_cse);
   jw.get("run_copy_prop", false, shrinker_config.run_copy_prop);
   jw.get("run_local_dce", false, shrinker_config.run_local_dce);
   jw.get("run_reg_alloc", false, shrinker_config.run_reg_alloc);
+  jw.get("run_fast_reg_alloc", false, shrinker_config.run_fast_reg_alloc);
   jw.get("run_dedup_blocks", false, shrinker_config.run_dedup_blocks);
   jw.get("debug", false, inliner_config->debug);
   jw.get("blocklist", {}, inliner_config->m_blocklist);
@@ -305,4 +305,11 @@ const ProguardMap& ConfigFiles::get_proguard_map() const {
 
 bool ConfigFiles::force_single_dex() const {
   return m_json.get("force_single_dex", false);
+}
+
+void ConfigFiles::set_outdir(const std::string& new_outdir) {
+  // Gotta ensure "meta" exists.
+  auto meta_path = boost::filesystem::path(new_outdir) / "meta";
+  boost::filesystem::create_directory(meta_path);
+  outdir = new_outdir;
 }

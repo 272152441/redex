@@ -8,8 +8,10 @@
 #include "Shrinker.h"
 
 #include "ConstructorParams.h"
+#include "LinearScan.h"
 #include "RandomForest.h"
 #include "RegisterAllocation.h"
+#include "ScopedMetrics.h"
 #include "Trace.h"
 
 namespace shrinker {
@@ -79,7 +81,8 @@ Shrinker::Shrinker(
       m_config(config),
       m_enabled(config.run_const_prop || config.run_cse ||
                 config.run_copy_prop || config.run_local_dce ||
-                config.run_reg_alloc || config.run_dedup_blocks),
+                config.run_reg_alloc || config.run_fast_reg_alloc ||
+                config.run_dedup_blocks),
       m_pure_methods(configured_pure_methods),
       m_finalish_field_names(configured_finalish_field_names) {
   if (config.run_cse || config.run_local_dce) {
@@ -243,6 +246,12 @@ void Shrinker::shrink_method(DexMethod* method) {
     }
   }
 
+  if (m_config.run_fast_reg_alloc) {
+    auto timer = m_fast_reg_alloc_timer.scope();
+    auto allocator = fastregalloc::LinearScanAllocator(method);
+    allocator.allocate();
+  }
+
   if (m_config.run_dedup_blocks) {
     auto timer = m_dedup_blocks_timer.scope();
     if (!code->editable_cfg_built()) {
@@ -280,6 +289,11 @@ void Shrinker::shrink_method(DexMethod* method) {
   m_dedup_blocks_stats += dedup_blocks_stats;
   m_methods_shrunk++;
   m_methods_reg_alloced += reg_alloc_inc;
+}
+
+void Shrinker::log_metrics(ScopedMetrics& sm) const {
+  auto scope = sm.scope("shrinker");
+  m_const_prop_stats.log_metrics(sm);
 }
 
 } // namespace shrinker

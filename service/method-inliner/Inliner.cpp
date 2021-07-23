@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <utility>
 
-#include "ABExperimentContext.h"
 #include "ApiLevelChecker.h"
 #include "CFGInliner.h"
 #include "ConcurrentContainers.h"
@@ -34,9 +33,8 @@
 #include "OptData.h"
 #include "OutlinedMethods.h"
 #include "Purity.h"
-#include "Resolver.h"
+#include "StlUtil.h"
 #include "Timer.h"
-#include "Transform.h"
 #include "UnknownVirtuals.h"
 #include "Walkers.h"
 #include "WorkQueue.h"
@@ -48,41 +46,24 @@ namespace {
 
 // The following costs are in terms of code-units (2 bytes).
 
-// Typical overhead of calling a method with a result. This isn't just the
-// overhead of the invoke instruction itself, but possibly some setup and
-// consumption of result.
-const size_t COST_INVOKE_WITH_RESULT = 5;
+// Typical overhead of calling a method, without move-result overhead.
+const float COST_INVOKE = 3.7f;
 
-// Typical overhead of calling a method without a result.
-const size_t COST_INVOKE_WITHOUT_RESULT = 3;
+// Typical overhead of having move-result instruction.
+const float COST_MOVE_RESULT = 3.0f;
 
 // Overhead of having a method and its metadata.
 const size_t COST_METHOD = 16;
 
 // When to consider running constant-propagation to better estimate inlined
 // cost. It just takes too much time to run the analysis for large methods.
-const size_t MAX_COST_FOR_CONSTANT_PROPAGATION = 272;
-
-// Minimum number of instructions needed across all constant arguments
-// variations before parallelizing constant-propagation.
-const size_t MIN_COST_FOR_PARALLELIZATION = 1977;
+const size_t MAX_COST_FOR_CONSTANT_PROPAGATION = 1000;
 
 /*
  * This is the maximum size of method that Dex bytecode can encode.
  * The table of instructions is indexed by a 32 bit unsigned integer.
  */
 constexpr uint64_t HARD_MAX_INSTRUCTION_SIZE = UINT64_C(1) << 32;
-
-/*
- * Some versions of ART (5.0.0 - 5.0.2) will fail to verify a method if it
- * is too large. See https://code.google.com/p/android/issues/detail?id=66655.
- *
- * The verifier rounds up to the next power of two, and doesn't support any
- * size greater than 16. See
- * http://androidxref.com/5.0.0_r2/xref/art/compiler/dex/verified_method.cc#107
- */
-constexpr uint32_t SOFT_MAX_INSTRUCTION_SIZE = 1 << 15;
-constexpr uint32_t INSTRUCTION_BUFFER = 1 << 12;
 
 } // namespace
 
@@ -96,17 +77,34 @@ MultiMethodInliner::MultiMethodInliner(
     MultiMethodInlinerMode mode /* default is InterDex */,
     const CalleeCallerInsns& true_virtual_callers,
     InlineForSpeed* inline_for_speed,
-    const std::unordered_map<const DexMethod*, size_t>*
-        same_method_implementations,
     bool analyze_and_prune_inits,
     const std::unordered_set<DexMethodRef*>& configured_pure_methods,
     const std::unordered_set<DexString*>& configured_finalish_field_names)
     : m_concurrent_resolver(std::move(concurrent_resolve_fn)),
+      m_scheduler(
+          [this](DexMethod* method) {
+            auto it = caller_callee.find(method);
+            if (it != caller_callee.end()) {
+              always_assert(!inline_inlinables_need_deconstruct(method));
+              std::unordered_set<DexMethod*> callees;
+              for (auto& p : it->second) {
+                callees.insert(p.first);
+              }
+              inline_callees(method, callees,
+                             /* filter_via_should_inline */ true);
+              // We schedule the post-processing, to allow other unlocked
+              // higher-priority tasks take precedence
+              m_scheduler.augment(
+                  method, [this, method] { postprocess_method(method); });
+            } else {
+              postprocess_method(method);
+            }
+          },
+          0),
       m_scope(scope),
       m_config(config),
       m_mode(mode),
       m_inline_for_speed(inline_for_speed),
-      m_same_method_implementations(same_method_implementations),
       m_analyze_and_prune_inits(analyze_and_prune_inits),
       m_shrinker(stores,
                  scope,
@@ -115,123 +113,108 @@ MultiMethodInliner::MultiMethodInliner(
                  configured_finalish_field_names) {
   Timer t("MultiMethodInliner construction");
   for (const auto& callee_callers : true_virtual_callers) {
-    for (const auto& caller_insns : callee_callers.second) {
+    auto callee = callee_callers.first;
+    if (callee_callers.second.other_call_sites) {
+      m_true_virtual_callees_with_other_call_sites.insert(callee);
+    }
+    for (const auto& caller_insns : callee_callers.second.caller_insns) {
       for (auto insn : caller_insns.second) {
-        caller_virtual_callee[caller_insns.first][insn] = callee_callers.first;
+        caller_virtual_callee[caller_insns.first][insn] = callee;
       }
+      auto& iinc = callee_callers.second.inlined_invokes_need_cast;
+      m_inlined_invokes_need_cast.insert(iinc.begin(), iinc.end());
     }
   }
   // Walk every opcode in scope looking for calls to inlinable candidates and
   // build a map of callers to callees and the reverse callees to callers. If
-  // intra_dex is false, we build the map for all the candidates. If intra_dex
-  // is true, we properly exclude methods who have callers being located in
-  // another dex from the candidates.
+  // mode != IntraDex, we build the map for all the candidates. If mode ==
+  // IntraDex, we properly exclude invocations where the caller is located in
+  // another dex from the callee, and remember all such x-dex callees.
+  ConcurrentSet<DexMethod*> concurrent_x_dex_callees;
+  ConcurrentMap<const DexMethod*, std::unordered_map<DexMethod*, size_t>>
+      concurrent_callee_caller;
+  ConcurrentMap<DexMethod*, std::unordered_map<DexMethod*, size_t>>
+      concurrent_caller_callee;
+  std::unique_ptr<XDexRefs> x_dex;
   if (mode == IntraDex) {
-    std::unordered_set<DexMethod*> candidate_callees(candidates.begin(),
-                                                     candidates.end());
-    ConcurrentSet<DexMethod*> concurrent_candidate_callees_to_erase;
-    ConcurrentMap<const DexMethod*, std::vector<DexMethod*>>
-        concurrent_callee_caller;
-    XDexRefs x_dex(stores);
-    walk::parallel::opcodes(
-        scope, [](DexMethod* caller) { return true; },
-        [&](DexMethod* caller, IRInstruction* insn) {
-          if (opcode::is_an_invoke(insn->opcode())) {
-            auto callee = m_concurrent_resolver(insn->get_method(),
-                                                opcode_to_search(insn));
-            if (callee != nullptr && callee->is_concrete() &&
-                candidate_callees.count(callee) &&
-                true_virtual_callers.count(callee) == 0) {
-              if (x_dex.cross_dex_ref(caller, callee)) {
-                if (concurrent_candidate_callees_to_erase.insert(callee)) {
-                  concurrent_callee_caller.erase(callee);
-                }
-              } else if (!concurrent_candidate_callees_to_erase.count(callee)) {
-                concurrent_callee_caller.update(
-                    callee,
-                    [caller](const DexMethod*, std::vector<DexMethod*>& v,
-                             bool) { v.push_back(caller); });
-              }
-            }
-          }
-        });
-    callee_caller.insert(concurrent_callee_caller.begin(),
-                         concurrent_callee_caller.end());
-    // While we already tried to do some cleanup during the parallel walk above,
-    // here we do a final sweep for correctness
-    for (auto callee : concurrent_candidate_callees_to_erase) {
-      candidate_callees.erase(callee);
+    x_dex = std::make_unique<XDexRefs>(stores);
+  }
+
+  walk::parallel::opcodes(
+      scope, [](DexMethod*) { return true; },
+      [&](DexMethod* caller, IRInstruction* insn) {
+        if (!opcode::is_an_invoke(insn->opcode())) {
+          return;
+        }
+        auto callee =
+            m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
+        if (callee == nullptr || !callee->is_concrete() ||
+            !candidates.count(callee) || true_virtual_callers.count(callee)) {
+          return;
+        }
+        if (x_dex && x_dex->cross_dex_ref(caller, callee)) {
+          concurrent_x_dex_callees.insert(callee);
+          return;
+        }
+        concurrent_callee_caller.update(
+            callee,
+            [caller](const DexMethod*,
+                     std::unordered_map<DexMethod*, size_t>& v,
+                     bool) { ++v[caller]; });
+        concurrent_caller_callee.update(
+            caller,
+            [callee](const DexMethod*,
+                     std::unordered_map<DexMethod*, size_t>& v,
+                     bool) { ++v[callee]; });
+      });
+  m_x_dex_callees.insert(concurrent_x_dex_callees.begin(),
+                         concurrent_x_dex_callees.end());
+  callee_caller.insert(concurrent_callee_caller.begin(),
+                       concurrent_callee_caller.end());
+  caller_callee.insert(concurrent_caller_callee.begin(),
+                       concurrent_caller_callee.end());
+  for (const auto& callee_callers : true_virtual_callers) {
+    auto callee = callee_callers.first;
+    for (const auto& caller_insns : callee_callers.second.caller_insns) {
+      auto caller = const_cast<DexMethod*>(caller_insns.first);
+      if (x_dex && x_dex->cross_dex_ref(caller, callee)) {
+        m_x_dex_callees.insert(callee);
+        continue;
+      }
+      ++callee_caller[callee][caller];
+      ++caller_callee[caller][callee];
+    }
+  }
+  if (inline_for_speed && !m_x_dex_callees.empty()) {
+    // pruning of any (caller, callee) pair if callee is involved in any x-dex
+    // caller/callee relationship
+    // TODO: This is to maintain the old IntraDex behavior for the
+    // PerfMethodInlinePass; evaluate if this is the best behavior for the
+    // PerfMethodInlinePass.
+    for (auto callee : m_x_dex_callees) {
       callee_caller.erase(callee);
     }
-    for (const auto& callee_callers : true_virtual_callers) {
-      auto callee = callee_callers.first;
-      for (const auto& caller_insns : callee_callers.second) {
-        auto caller = caller_insns.first;
-        if (x_dex.cross_dex_ref(callee, caller)) {
-          callee_caller.erase(callee);
-          break;
-        }
-        callee_caller[callee].push_back(caller);
-      }
+    for (auto& p : caller_callee) {
+      std20::erase_if(
+          p.second, [&](auto& it) { return m_x_dex_callees.count(it->first); });
     }
-    for (auto& pair : callee_caller) {
-      DexMethod* callee = const_cast<DexMethod*>(pair.first);
-      const auto& callers = pair.second;
-      for (auto caller : callers) {
-        caller_callee[caller].push_back(callee);
-      }
-    }
-  } else if (mode == InterDex) {
-    ConcurrentMap<const DexMethod*, std::vector<DexMethod*>>
-        concurrent_callee_caller;
-    ConcurrentMap<DexMethod*, std::vector<DexMethod*>> concurrent_caller_callee;
-    walk::parallel::opcodes(
-        scope, [](DexMethod* caller) { return true; },
-        [&](DexMethod* caller, IRInstruction* insn) {
-          if (opcode::is_an_invoke(insn->opcode())) {
-            auto callee = m_concurrent_resolver(insn->get_method(),
-                                                opcode_to_search(insn));
-            if (true_virtual_callers.count(callee) == 0 && callee != nullptr &&
-                callee->is_concrete() && candidates.count(callee)) {
-              concurrent_callee_caller.update(
-                  callee,
-                  [caller](const DexMethod*, std::vector<DexMethod*>& v, bool) {
-                    v.push_back(caller);
-                  });
-              concurrent_caller_callee.update(
-                  caller,
-                  [callee](const DexMethod*, std::vector<DexMethod*>& v, bool) {
-                    v.push_back(callee);
-                  });
-            }
-          }
-        });
-    callee_caller.insert(concurrent_callee_caller.begin(),
-                         concurrent_callee_caller.end());
-    caller_callee.insert(concurrent_caller_callee.begin(),
-                         concurrent_caller_callee.end());
-    for (const auto& callee_callers : true_virtual_callers) {
-      auto callee = callee_callers.first;
-      for (const auto& caller_insns : callee_callers.second) {
-        auto caller = caller_insns.first;
-        callee_caller[callee].push_back(caller);
-        caller_callee[caller].push_back(callee);
-      }
-    }
+    std20::erase_if(caller_callee,
+                    [&](auto& it) { return it->second.empty(); });
   }
 }
 
 /*
- * The key of a constant-arguments data structure is a canonical string
- * representation of the constant arguments. Usually, the string is quite small,
- * it only rarely contains fields or methods.
+ * The key of a call-site-summary is a canonical string representation of the
+ * constant arguments. Usually, the string is quite small, it only rarely
+ * contains fields or methods.
  */
-static std::string get_key(const ConstantArguments& constant_arguments) {
-  always_assert(!constant_arguments.is_bottom());
-  if (constant_arguments.is_top()) {
-    return "";
+static std::string get_key(const CallSiteSummary& call_site_summary) {
+  always_assert(!call_site_summary.arguments.is_bottom());
+  static std::array<std::string, 2> result_used_strs = {"-", "+"};
+  if (call_site_summary.arguments.is_top()) {
+    return result_used_strs[call_site_summary.result_used];
   }
-  const auto& bindings = constant_arguments.bindings();
+  const auto& bindings = call_site_summary.arguments.bindings();
   std::vector<reg_t> ordered_arg_idxes;
   for (auto& p : bindings) {
     ordered_arg_idxes.push_back(p.first);
@@ -239,6 +222,7 @@ static std::string get_key(const ConstantArguments& constant_arguments) {
   always_assert(!ordered_arg_idxes.empty());
   std::sort(ordered_arg_idxes.begin(), ordered_arg_idxes.end());
   std::ostringstream oss;
+  oss << result_used_strs[call_site_summary.result_used];
   for (auto arg_idx : ordered_arg_idxes) {
     if (arg_idx != ordered_arg_idxes.front()) {
       oss << ",";
@@ -262,6 +246,7 @@ static std::string get_key(const ConstantArguments& constant_arguments) {
       if (object->jvm_cached_singleton) {
         oss << "(cached)";
       }
+      oss << show(object->type);
       oss << "{";
       bool first{true};
       for (auto& attr : object->attributes) {
@@ -295,62 +280,160 @@ static std::string get_key(const ConstantArguments& constant_arguments) {
   return oss.str();
 }
 
-void MultiMethodInliner::compute_callee_constant_arguments() {
-  if (!m_config.use_constant_propagation_and_local_dce_for_callee_size) {
+void MultiMethodInliner::compute_call_site_summaries() {
+  if (!m_config.use_call_site_summaries) {
     return;
   }
 
-  Timer t("compute_callee_constant_arguments");
+  Timer t("compute_call_site_summaries");
   struct CalleeInfo {
-    std::unordered_map<std::string, ConstantArguments> constant_arguments;
+    std::unordered_map<std::string, CallSiteSummary> call_site_summaries;
     std::unordered_map<std::string, size_t> occurrences;
   };
-  ConcurrentMap<DexMethod*, CalleeInfo> concurrent_callee_constant_arguments;
-  auto wq = workqueue_foreach<DexMethod*>(
-      [&](DexMethod* caller) {
-        auto& callees = caller_callee.at(caller);
-        auto res = get_invoke_constant_arguments(caller, callees);
-        if (!res) {
-          return;
-        }
-        for (auto& p : res->invoke_constant_arguments) {
-          auto insn = p.first->insn;
-          auto callee =
-              m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
-          const auto& constant_arguments = p.second;
-          auto key = get_key(constant_arguments);
-          concurrent_callee_constant_arguments.update(
-              callee, [&](const DexMethod*, CalleeInfo& ci, bool /* exists */) {
-                ci.constant_arguments.emplace(key, constant_arguments);
-                ++ci.occurrences[key];
-              });
-          m_call_constant_arguments.emplace(insn, constant_arguments);
-        }
-        info.constant_invoke_callers_analyzed++;
-        info.constant_invoke_callers_unreachable_blocks += res->dead_blocks;
-      },
-      redex_parallel::default_num_threads());
-  for (auto& p : caller_callee) {
-    wq.add_item(p.first);
+
+  // We'll do a top-down traversal of all call-sites, in order to propagate
+  // call-site information from outer call-sites to nested call-sites, improving
+  // the precision of the analysis. This is effectively an inter-procedural
+  // constant-propagation analysis, but we are operating on a reduced call-graph
+  // as recursion has been broken by eliminating some call-sites from
+  // consideration, and we are only considering those methods that are involved
+  // in an inlinable caller-callee relationship, which excludes much of true
+  // virtual methods.
+  PriorityThreadPoolDAGScheduler<DexMethod*> summaries_scheduler;
+
+  ConcurrentMap<DexMethod*, std::shared_ptr<CalleeInfo>>
+      concurrent_callee_infos;
+
+  // Helper function to retrieve a list of callers of a callee such that all
+  // possible call-sites to the callee are in the returned callers.
+  auto get_dependencies =
+      [&](DexMethod* callee) -> std::unordered_map<DexMethod*, size_t>* {
+    auto it = callee_caller.find(callee);
+    if (it == callee_caller.end() || m_recursive_callees.count(callee) ||
+        m_x_dex_callees.count(callee) || root(callee) || !can_rename(callee) ||
+        m_true_virtual_callees_with_other_call_sites.count(callee)) {
+      return nullptr;
+    }
+    // If we get here, then we know all possible call-sites to the callee, and
+    // they reside in the known list of callers.
+    return &it->second;
   };
-  wq.run_all();
-  for (auto& p : concurrent_callee_constant_arguments) {
-    auto& v = m_callee_constant_arguments[p.first];
-    const auto& ci = p.second;
-    for (const auto& q : ci.occurrences) {
+
+  summaries_scheduler.set_executor([&](DexMethod* method) {
+    CallSiteArguments arguments;
+    if (!get_dependencies(method)) {
+      // There are no relevant callers from which we could gather incoming
+      // constant arguments.
+      arguments = CallSiteArguments::top();
+    } else {
+      auto ci = concurrent_callee_infos.get(method, nullptr);
+      if (!ci) {
+        // All callers were unreachable
+        arguments = CallSiteArguments::bottom();
+      } else {
+        // The only way to call this method is by going through a set of known
+        // call-sites. We join together all those incoming constant arguments.
+        always_assert(!ci->call_site_summaries.empty());
+        auto it = ci->call_site_summaries.begin();
+        arguments = it->second.arguments;
+        for (it++; it != ci->call_site_summaries.end(); it++) {
+          arguments.join_with(it->second.arguments);
+        }
+      }
+    }
+
+    if (arguments.is_bottom()) {
+      // unreachable
+      info.constant_invoke_callers_unreachable++;
+      return;
+    }
+    auto& callees = caller_callee.at(method);
+    ConstantEnvironment initial_env =
+        constant_propagation::interprocedural::env_with_params(
+            is_static(method), method->get_code(), arguments);
+    auto res = get_invoke_call_site_summaries(method, callees, initial_env);
+    for (auto& p : res.invoke_call_site_summaries) {
+      auto insn = p.first->insn;
+      auto callee = get_callee(method, insn);
+      auto call_site_summary = std::move(p.second);
+      auto key = get_key(call_site_summary);
+      concurrent_callee_infos.update(
+          callee, [&](const DexMethod*, std::shared_ptr<CalleeInfo>& ci,
+                      bool /* exists */) {
+            if (!ci) {
+              ci = std::make_shared<CalleeInfo>();
+            }
+            auto q = ci->call_site_summaries.emplace(key, call_site_summary);
+            if (!q.second) {
+              always_assert_log(
+                  q.first->second.result_used == call_site_summary.result_used,
+                  "same key %s for\n    %d\nvs. %d", key.c_str(),
+                  q.first->second.result_used, call_site_summary.result_used);
+              always_assert_log(
+                  q.first->second.arguments.equals(call_site_summary.arguments),
+                  "same key %s for\n    %s\nvs. %s", key.c_str(),
+                  SHOW(q.first->second.arguments),
+                  SHOW(call_site_summary.arguments));
+            }
+            ++ci->occurrences[key];
+          });
+      m_invoke_call_site_summaries.emplace(insn, std::move(call_site_summary));
+    }
+    info.constant_invoke_callers_analyzed++;
+    info.constant_invoke_callers_unreachable_blocks += res.dead_blocks;
+  });
+
+  std::vector<DexMethod*> callers;
+  for (auto& p : caller_callee) {
+    auto method = const_cast<DexMethod*>(p.first);
+    callers.push_back(method);
+    auto dependencies = get_dependencies(method);
+    if (dependencies) {
+      for (auto& q : *dependencies) {
+        summaries_scheduler.add_dependency(method, q.first);
+      }
+    }
+  }
+  info.constant_invoke_callers_critical_path_length =
+      summaries_scheduler.run(callers.begin(), callers.end());
+
+  for (auto& p : concurrent_callee_infos) {
+    auto& v = m_callee_call_site_summary_occurrences[p.first];
+    auto ci = p.second;
+    for (const auto& q : ci->occurrences) {
       const auto& key = q.first;
-      const auto& constant_arguments = q.second;
-      v.emplace_back(ci.constant_arguments.at(key), constant_arguments);
+      const auto& count = q.second;
+      v.emplace_back(ci->call_site_summaries.at(key), count);
     }
   }
 }
 
-void MultiMethodInliner::inline_methods() {
-  compute_callee_constant_arguments();
+void MultiMethodInliner::inline_methods(bool methods_need_deconstruct) {
+  std::unordered_set<IRCode*> need_deconstruct;
+  if (methods_need_deconstruct) {
+    for (auto& p : caller_callee) {
+      need_deconstruct.insert(const_cast<IRCode*>(p.first->get_code()));
+    }
+    for (auto& p : callee_caller) {
+      need_deconstruct.insert(const_cast<IRCode*>(p.first->get_code()));
+    }
+    for (auto it = need_deconstruct.begin(); it != need_deconstruct.end();) {
+      if ((*it)->editable_cfg_built()) {
+        it = need_deconstruct.erase(it);
+      } else {
+        it++;
+      }
+    }
+    if (!need_deconstruct.empty()) {
+      workqueue_run<IRCode*>(
+          [](IRCode* code) { code->build_cfg(/* editable */ true); },
+          need_deconstruct);
+    }
+  }
 
   // Inlining and shrinking initiated from within this method will be done
   // in parallel.
-  m_async_method_executor.set_num_threads(
+  m_scheduler.get_thread_pool().set_num_threads(
       m_config.debug ? 1 : redex_parallel::default_num_threads());
 
   // The order in which we inline is such that once a callee is considered to
@@ -372,117 +455,73 @@ void MultiMethodInliner::inline_methods() {
   m_delayed_change_visibilities = std::make_unique<
       ConcurrentMap<DexMethod*, std::unordered_set<DexType*>>>();
 
-  // we want to inline bottom up, so as a first step we identify all the
-  // top level callers, then we recurse into all inlinable callees until we
-  // hit a leaf and we start inlining from there.
-  // First, we just gather data on caller/non-recursive-callees pairs for each
-  // stack depth.
+  // we want to inline bottom up, so as a first step, for all callers, we
+  // recurse into all inlinable callees until we hit a leaf and we start
+  // inlining from there. First, we just gather data on
+  // caller/non-recursive-callees pairs for each stack depth.
   std::unordered_map<DexMethod*, size_t> visited;
-  CallerNonrecursiveCalleesByStackDepth
-      caller_nonrecursive_callees_by_stack_depth;
   {
     Timer t("compute_caller_nonrecursive_callees_by_stack_depth");
     std::vector<DexMethod*> ordered_callers;
     ordered_callers.reserve(caller_callee.size());
     for (auto& p : caller_callee) {
-      ordered_callers.push_back(p.first);
+      ordered_callers.push_back(const_cast<DexMethod*>(p.first));
     }
     std::sort(ordered_callers.begin(), ordered_callers.end(),
               compare_dexmethods);
     for (const auto caller : ordered_callers) {
       TraceContext context(caller);
-      // if the caller is not a top level keep going, it will be traversed
-      // when inlining a top level caller
-      if (callee_caller.find(caller) != callee_caller.end()) continue;
-      sparta::PatriciaTreeSet<DexMethod*> call_stack;
-      const auto& callees = caller_callee.at(caller);
-      auto stack_depth = compute_caller_nonrecursive_callees_by_stack_depth(
-          caller, callees, call_stack, &visited,
-          &caller_nonrecursive_callees_by_stack_depth);
+      auto stack_depth = prune_caller_nonrecursive_callees(caller, &visited);
       info.max_call_stack_depth =
           std::max(info.max_call_stack_depth, stack_depth);
     }
   }
 
-  std::vector<size_t> ordered_stack_depths;
-  for (auto& p : caller_nonrecursive_callees_by_stack_depth) {
-    ordered_stack_depths.push_back(p.first);
-  }
-  std::sort(ordered_stack_depths.begin(), ordered_stack_depths.end());
+  compute_call_site_summaries();
 
   // Second, compute caller priorities --- the callers get a priority assigned
   // that reflects how many other callers will be waiting for them.
-  // We also compute the set of callers and some other auxiliary data structures
-  // along the way.
-  // TODO: Instead of just considering the length of the critical path as the
-  // priority, consider some variations, e.g. include the fan-out of the
-  // dependencies divided by the number of threads.
-  for (int i = ((int)ordered_stack_depths.size()) - 1; i >= 0; i--) {
-    auto stack_depth = ordered_stack_depths.at(i);
-    auto& caller_nonrecursive_callees =
-        caller_nonrecursive_callees_by_stack_depth.at(stack_depth);
-    for (auto& p : caller_nonrecursive_callees) {
-      auto caller = p.first;
-      auto& callees = p.second;
-      always_assert(!callees.empty());
-      int caller_priority = 0;
-      auto method_priorities_it = m_async_callee_priorities.find(caller);
-      if (method_priorities_it != m_async_callee_priorities.end()) {
-        caller_priority = method_priorities_it->second;
-      }
-      for (auto callee : callees) {
-        auto& callee_priority = m_async_callee_priorities[callee];
-        callee_priority = std::max(callee_priority, caller_priority + 1);
-        m_async_callee_callers[callee].push_back(caller);
-      }
-      m_async_caller_wait_counts.emplace(caller, callees.size());
-      m_async_caller_callees.emplace(caller, callees);
-    }
-  }
-  for (auto& p : m_async_callee_callers) {
-    auto callee = p.first;
-    auto& callers = p.second;
-    auto& callee_priority = m_async_callee_priorities[callee];
-    info.critical_path_length =
-        std::max(info.critical_path_length, callee_priority);
-    callee_priority = (callee_priority << 16) + callers.size();
-  }
-
-  // Kick off (shrinking and) pre-computing the should-inline cache.
-  // Once all callees of a caller have been processed, then postprocessing
-  // will in turn kick off processing of the caller.
-  for (auto& p : m_async_callee_priorities) {
-    auto callee = p.first;
-    auto priority = p.second;
-    always_assert(priority > 0);
-    if (m_async_caller_callees.count(callee) == 0) {
-      async_postprocess_method(const_cast<DexMethod*>(callee));
+  std::unordered_set<DexMethod*> methods_to_schedule;
+  for (auto& p : caller_callee) {
+    auto caller = p.first;
+    for (auto& q : p.second) {
+      auto callee = q.first;
+      m_scheduler.add_dependency(const_cast<DexMethod*>(caller), callee);
     }
   }
 
+  // Third, schedule and run tasks for all selected methods.
   if (m_shrinker.enabled() && m_config.shrink_other_methods) {
     walk::code(m_scope, [&](DexMethod* method, IRCode& code) {
-      // If a method is not tracked as a caller, and not already in the
-      // processing pool because it's a callee, then process it.
-      if (m_async_caller_callees.count(method) == 0 &&
-          m_async_callee_priorities.count(method) == 0) {
-        async_postprocess_method(const_cast<DexMethod*>(method));
-      }
+      methods_to_schedule.insert(method);
     });
+  } else {
+    for (auto& p : caller_callee) {
+      methods_to_schedule.insert(const_cast<DexMethod*>(p.first));
+    }
+    for (auto& p : callee_caller) {
+      methods_to_schedule.insert(const_cast<DexMethod*>(p.first));
+    }
   }
 
-  m_async_method_executor.join();
+  info.critical_path_length =
+      m_scheduler.run(methods_to_schedule.begin(), methods_to_schedule.end());
   delayed_change_visibilities();
-  info.waited_seconds = m_async_method_executor.get_waited_seconds();
+  info.waited_seconds = m_scheduler.get_thread_pool().get_waited_seconds();
+
+  if (!need_deconstruct.empty()) {
+    workqueue_run<IRCode*>([](IRCode* code) { code->clear_cfg(); },
+                           need_deconstruct);
+  }
 }
 
-size_t MultiMethodInliner::compute_caller_nonrecursive_callees_by_stack_depth(
-    DexMethod* caller,
-    const std::vector<DexMethod*>& callees,
-    sparta::PatriciaTreeSet<DexMethod*> call_stack,
-    std::unordered_map<DexMethod*, size_t>* visited,
-    CallerNonrecursiveCalleesByStackDepth*
-        caller_nonrecursive_callees_by_stack_depth) {
+size_t MultiMethodInliner::prune_caller_nonrecursive_callees(
+    DexMethod* caller, std::unordered_map<DexMethod*, size_t>* visited) {
+  auto caller_it = caller_callee.find(caller);
+  if (caller_it == caller_callee.end()) {
+    return 0;
+  }
+  auto& callees = caller_it->second;
   always_assert(!callees.empty());
 
   auto visited_it = visited->find(caller);
@@ -492,90 +531,57 @@ size_t MultiMethodInliner::compute_caller_nonrecursive_callees_by_stack_depth(
 
   // We'll only know the exact call stack depth at the end.
   visited->emplace(caller, std::numeric_limits<size_t>::max());
-  call_stack.insert(caller);
 
-  std::vector<DexMethod*> nonrecursive_callees;
-  nonrecursive_callees.reserve(callees.size());
-  std::unordered_map<DexMethod*, size_t> unique_callees;
-  for (auto callee : callees) {
-    unique_callees[callee]++;
+  std::vector<DexMethod*> ordered_callees;
+  ordered_callees.reserve(callees.size());
+  for (auto& p : callees) {
+    ordered_callees.push_back(p.first);
   }
-  std::vector<DexMethod*> ordered_unique_callees;
-  ordered_unique_callees.reserve(unique_callees.size());
-  for (auto& p : unique_callees) {
-    ordered_unique_callees.push_back(p.first);
-  }
-  std::sort(ordered_unique_callees.begin(), ordered_unique_callees.end(),
-            compare_dexmethods);
+  std::sort(ordered_callees.begin(), ordered_callees.end(), compare_dexmethods);
   size_t stack_depth = 0;
   // recurse into the callees in case they have something to inline on
   // their own. We want to inline bottom up so that a callee is
   // completely resolved by the time it is inlined.
-  for (auto callee : ordered_unique_callees) {
-    if (call_stack.contains(callee)) {
+  for (auto callee : ordered_callees) {
+    size_t callee_stack_depth =
+        prune_caller_nonrecursive_callees(callee, visited);
+    if (callee_stack_depth == std::numeric_limits<size_t>::max()) {
       // we've found recursion in the current call stack
-      always_assert(visited->at(callee) == std::numeric_limits<size_t>::max());
-      info.recursive += unique_callees.at(callee);
-      continue;
-    }
-    size_t callee_stack_depth = 0;
-    auto maybe_caller = caller_callee.find(callee);
-    if (maybe_caller != caller_callee.end()) {
-      callee_stack_depth = compute_caller_nonrecursive_callees_by_stack_depth(
-          callee, maybe_caller->second, call_stack, visited,
-          caller_nonrecursive_callees_by_stack_depth);
-    }
+      info.recursive += callees.at(callee);
+      m_recursive_callees.insert(callee);
+    } else {
+      stack_depth = std::max(stack_depth, callee_stack_depth + 1);
 
-    stack_depth = std::max(stack_depth, callee_stack_depth + 1);
-
-    if (for_speed() &&
-        !m_inline_for_speed->should_inline_generic(caller, callee)) {
-      continue;
+      if (!for_speed() ||
+          m_inline_for_speed->should_inline_generic(caller, callee)) {
+        continue;
+      }
     }
 
-    for (size_t i = 0; i < unique_callees.at(callee); i++) {
-      nonrecursive_callees.push_back(callee);
+    // If we get here, we shall prune the (caller, callee) pair.
+    callees.erase(callee);
+    if (callees.empty()) {
+      caller_callee.erase(caller);
+    }
+    auto& callers = callee_caller.at(callee);
+    callers.erase(caller);
+    if (callers.empty()) {
+      callee_caller.erase(callee);
     }
   }
 
   (*visited)[caller] = stack_depth;
-  if (!nonrecursive_callees.empty()) {
-    (*caller_nonrecursive_callees_by_stack_depth)[stack_depth].push_back(
-        std::make_pair(caller, nonrecursive_callees));
-  }
   return stack_depth;
 }
 
-void MultiMethodInliner::caller_inline(
-    DexMethod* caller, const std::vector<DexMethod*>& nonrecursive_callees) {
-  TraceContext context(caller);
-  // We select callees to inline into this caller
-  std::vector<DexMethod*> selected_callees;
-  std::vector<DexMethod*> optional_selected_callees;
-  selected_callees.reserve(nonrecursive_callees.size());
-  for (auto callee : nonrecursive_callees) {
-    if (should_inline(callee)) {
-      selected_callees.push_back(callee);
-    } else {
-      optional_selected_callees.push_back(callee);
-    }
-  }
-
-  if (!selected_callees.empty() || !optional_selected_callees.empty()) {
-    inline_callees(caller, selected_callees, optional_selected_callees);
-  }
-}
-
-boost::optional<InvokeConstantArgumentsAndDeadBlocks>
-MultiMethodInliner::get_invoke_constant_arguments(
-    DexMethod* caller, const std::vector<DexMethod*>& callees) {
+InvokeCallSiteSummariesAndDeadBlocks
+MultiMethodInliner::get_invoke_call_site_summaries(
+    DexMethod* caller,
+    const std::unordered_map<DexMethod*, size_t>& callees,
+    const ConstantEnvironment& initial_env) {
   IRCode* code = caller->get_code();
-  if (!code->editable_cfg_built()) {
-    return boost::none;
-  }
 
-  InvokeConstantArgumentsAndDeadBlocks res;
-  std::unordered_set<DexMethod*> callees_set(callees.begin(), callees.end());
+  InvokeCallSiteSummariesAndDeadBlocks res;
   auto& cfg = code->cfg();
   constant_propagation::intraprocedural::FixpointIterator intra_cp(
       cfg,
@@ -584,8 +590,6 @@ MultiMethodInliner::get_invoke_constant_arguments(
           m_shrinker.get_immut_analyzer_state(),
           constant_propagation::EnumFieldAnalyzerState::get(),
           constant_propagation::BoxedBooleanAnalyzerState::get(), nullptr));
-  auto initial_env = constant_propagation::interprocedural::env_with_params(
-      is_static(caller), code, {});
   intra_cp.run(initial_env);
   for (const auto& block : cfg.blocks()) {
     auto env = intra_cp.get_entry_state_at(block);
@@ -595,22 +599,24 @@ MultiMethodInliner::get_invoke_constant_arguments(
       continue;
     }
     auto last_insn = block->get_last_insn();
-    for (auto& mie : InstructionIterable(block)) {
-      auto insn = mie.insn;
-      if (opcode::is_an_invoke(insn->opcode())) {
-        auto callee =
-            m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
-        if (callees_set.count(callee)) {
-          ConstantArguments constant_arguments;
-          const auto& srcs = insn->srcs();
-          for (size_t i = is_static(callee) ? 0 : 1; i < srcs.size(); ++i) {
-            auto val = env.get(srcs[i]);
-            always_assert(!val.is_bottom());
-            constant_arguments.set(i, val);
-          }
-          res.invoke_constant_arguments.emplace_back(code->iterator_to(mie),
-                                                     constant_arguments);
+    auto iterable = InstructionIterable(block);
+    for (auto it = iterable.begin(); it != iterable.end(); it++) {
+      auto insn = it->insn;
+      auto callee = get_callee(caller, insn);
+      if (callee && callees.count(callee)) {
+        CallSiteSummary call_site_summary;
+        const auto& srcs = insn->srcs();
+        for (size_t i = is_static(callee) ? 0 : 1; i < srcs.size(); ++i) {
+          auto val = env.get(srcs[i]);
+          always_assert(!val.is_bottom());
+          call_site_summary.arguments.set(i, val);
         }
+        call_site_summary.result_used =
+            !callee->get_proto()->is_void() &&
+            !cfg.move_result_of(block->to_cfg_instruction_iterator(it))
+                 .is_end();
+        res.invoke_call_site_summaries.emplace_back(
+            it.unwrap(), std::move(call_site_summary));
       }
       intra_cp.analyze_instruction(insn, &env, insn == last_insn->insn);
       if (env.is_bottom()) {
@@ -623,75 +629,89 @@ MultiMethodInliner::get_invoke_constant_arguments(
   return res;
 }
 
+DexMethod* MultiMethodInliner::get_callee(DexMethod* caller,
+                                          IRInstruction* insn) {
+  if (!opcode::is_an_invoke(insn->opcode())) {
+    return nullptr;
+  }
+  auto callee =
+      m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
+  auto it = caller_virtual_callee.find(caller);
+  if (it == caller_virtual_callee.end()) {
+    return callee;
+  }
+  auto it2 = it->second.find(insn);
+  if (it2 == it->second.end()) {
+    return callee;
+  }
+  return it2->second;
+}
+
 void MultiMethodInliner::inline_callees(
     DexMethod* caller,
-    const std::vector<DexMethod*>& callees,
-    const std::vector<DexMethod*>& optional_callees) {
+    const std::unordered_set<DexMethod*>& callees,
+    bool filter_via_should_inline) {
   TraceContext context{caller};
-  size_t found = 0;
-
-  // walk the caller opcodes collecting all candidates to inline
-  // Build a callee to opcode map
   std::vector<Inlinable> inlinables;
-  auto max = callees.size() + optional_callees.size();
-  editable_cfg_adapter::iterate_with_iterator(
-      caller->get_code(), [&](const IRList::iterator& it) {
-        auto insn = it->insn;
-        if (!opcode::is_an_invoke(insn->opcode())) {
-          return editable_cfg_adapter::LOOP_CONTINUE;
-        }
-        auto callee =
-            m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
-        if (caller_virtual_callee.count(caller) &&
-            caller_virtual_callee[caller].count(insn)) {
-          callee = caller_virtual_callee[caller][insn];
-          always_assert(callee);
-        }
-        if (callee == nullptr) {
-          return editable_cfg_adapter::LOOP_CONTINUE;
-        }
-        bool optional{false};
-        if (std::find(callees.begin(), callees.end(), callee) ==
-            callees.end()) {
-          // If a callee wasn't in the list of general callees, that means that
-          // it's not beneficial on average (across all callsites) to inline the
-          // callee. However, let's see if it's beneficial for this particular
-          // callsite, taking into account constant-arguments (if any).
-          if (std::find(optional_callees.begin(), optional_callees.end(),
-                        callee) != optional_callees.end() &&
-              should_inline_optional(caller, insn, callee)) {
-            optional = true;
-          } else {
+  {
+    auto timer = m_inline_callees_timer.scope();
+
+    // walk the caller opcodes collecting all candidates to inline
+    // Build a callee to opcode map
+    editable_cfg_adapter::iterate_with_iterator(
+        caller->get_code(), [&](const IRList::iterator& it) {
+          auto insn = it->insn;
+          auto callee = get_callee(caller, insn);
+          if (!callee || !callees.count(callee)) {
             return editable_cfg_adapter::LOOP_CONTINUE;
           }
-        }
-        always_assert(callee->is_concrete());
-        if (m_analyze_and_prune_inits && method::is_init(callee)) {
-          if (!callee->get_code()->editable_cfg_built()) {
-            return editable_cfg_adapter::LOOP_CONTINUE;
-          }
-          if (!can_inline_init(callee)) {
-            if (!method::is_init(caller) ||
-                caller->get_class() != callee->get_class() ||
-                !caller->get_code()->editable_cfg_built() ||
-                !constructor_analysis::can_inline_inits_in_same_class(
-                    caller, callee, insn)) {
+          const std::unordered_set<cfg::Block*>* dead_blocks{nullptr};
+          bool no_return{false};
+          size_t insn_size{0};
+          if (filter_via_should_inline) {
+            auto timer2 = m_inline_callees_should_inline_timer.scope();
+            // Cost model is based on fully inlining callee everywhere; let's
+            // see if we can get more detailed call-site specific information
+            if (should_inline_at_call_site(caller, insn, callee, &no_return,
+                                           &dead_blocks, &insn_size)) {
+              always_assert(!no_return);
+              // Yes, we know might have dead_blocks and a refined insn_size
+            } else if (should_inline_always(callee)) {
+              // We'll fully inline the callee without any adjustments
+              no_return = false;
+              insn_size = get_callee_insn_size(callee);
+            } else if (no_return) {
+              always_assert(insn_size == 0);
+              always_assert(!dead_blocks);
+            } else {
               return editable_cfg_adapter::LOOP_CONTINUE;
             }
+          } else {
+            insn_size = get_callee_insn_size(callee);
           }
-        }
+          always_assert(callee->is_concrete());
+          if (m_analyze_and_prune_inits && method::is_init(callee) &&
+              !no_return) {
+            auto timer2 = m_inline_callees_init_timer.scope();
+            if (!callee->get_code()->editable_cfg_built()) {
+              return editable_cfg_adapter::LOOP_CONTINUE;
+            }
+            if (!can_inline_init(callee)) {
+              if (!method::is_init(caller) ||
+                  caller->get_class() != callee->get_class() ||
+                  !caller->get_code()->editable_cfg_built() ||
+                  !constructor_analysis::can_inline_inits_in_same_class(
+                      caller, callee, insn)) {
+                return editable_cfg_adapter::LOOP_CONTINUE;
+              }
+            }
+          }
 
-        inlinables.push_back((Inlinable){callee, it, insn, optional});
-        if (++found == max) {
-          return editable_cfg_adapter::LOOP_BREAK;
-        }
-        return editable_cfg_adapter::LOOP_CONTINUE;
-      });
-  if (found != max) {
-    always_assert(found <= max);
-    info.not_found += max - found;
+          inlinables.push_back(
+              (Inlinable){callee, it, insn, no_return, dead_blocks, insn_size});
+          return editable_cfg_adapter::LOOP_CONTINUE;
+        });
   }
-
   if (!inlinables.empty()) {
     inline_inlinables(caller, inlinables);
   }
@@ -705,17 +725,13 @@ void MultiMethodInliner::inline_callees(
       caller->get_code(), [&](const IRList::iterator& it) {
         auto insn = it->insn;
         if (insns.count(insn)) {
-          auto callee =
-              m_concurrent_resolver(insn->get_method(), opcode_to_search(insn));
-          if (caller_virtual_callee.count(caller) &&
-              caller_virtual_callee[caller].count(insn)) {
-            callee = caller_virtual_callee[caller][insn];
-          }
+          auto callee = get_callee(caller, insn);
           if (callee == nullptr) {
             return editable_cfg_adapter::LOOP_CONTINUE;
           }
           always_assert(callee->is_concrete());
-          inlinables.push_back((Inlinable){callee, it, insn});
+          inlinables.push_back((Inlinable){callee, it, insn, false, nullptr,
+                                           get_callee_insn_size(callee)});
         }
         return editable_cfg_adapter::LOOP_CONTINUE;
       });
@@ -726,7 +742,7 @@ void MultiMethodInliner::inline_callees(
 bool MultiMethodInliner::inline_inlinables_need_deconstruct(DexMethod* method) {
   // The mixed CFG, IRCode is used by Switch Inline (only?) where the caller is
   // an IRCode and the callee is a CFG.
-  return m_config.use_cfg_inliner && !method->get_code()->editable_cfg_built();
+  return !method->get_code()->editable_cfg_built();
 }
 
 namespace {
@@ -758,8 +774,10 @@ std::string create_inlining_trace_msg(const DexMethod* caller,
       oss << "!" << max_depth;
       if (insn != nullptr) {
         auto it = code->cfg().find_insn(insn);
-        redex_assert(!it.is_end());
-        auto loop = info.get_loop_for(it.block());
+        loop_impl::Loop* loop{nullptr};
+        if (!it.is_end()) {
+          loop = info.get_loop_for(it.block());
+        }
         if (loop != nullptr) {
           oss << "!" << loop->get_loop_depth();
         } else {
@@ -782,7 +800,7 @@ std::string create_inlining_trace_msg(const DexMethod* caller,
 
 void MultiMethodInliner::inline_inlinables(
     DexMethod* caller_method, const std::vector<Inlinable>& inlinables) {
-
+  auto timer = m_inline_inlinables_timer.scope();
   auto caller = caller_method->get_code();
   std::unordered_set<IRCode*> need_deconstruct;
   if (inline_inlinables_need_deconstruct(caller_method)) {
@@ -798,9 +816,9 @@ void MultiMethodInliner::inline_inlinables(
   }
 
   // attempt to inline all inlinable candidates
-  size_t estimated_insn_size = caller->editable_cfg_built()
-                                   ? caller->cfg().sum_opcode_sizes()
-                                   : caller->sum_opcode_sizes();
+  size_t estimated_caller_size = caller->editable_cfg_built()
+                                     ? caller->cfg().sum_opcode_sizes()
+                                     : caller->sum_opcode_sizes();
 
   // Prefer inlining smaller methods first, so that we are less likely to hit
   // overall size limit.
@@ -809,56 +827,110 @@ void MultiMethodInliner::inline_inlinables(
 
   std::stable_sort(ordered_inlinables.begin(), ordered_inlinables.end(),
                    [&](const Inlinable& a, const Inlinable& b) {
-                     // First, prefer non-optional inlinables, as they were
-                     // (potentially) selected with a global cost model, taking
-                     // into account the savings achieved when eliminating all
-                     // calls
-                     if (a.optional != b.optional) {
-                       return a.optional < b.optional;
+                     // First, prefer no-return inlinable, as they cut off
+                     // control-flow and thus other inlinables.
+                     if (a.no_return != b.no_return) {
+                       return a.no_return > b.no_return;
                      }
                      // Second, prefer smaller methods, to avoid hitting size
                      // limits too soon
-                     return get_callee_insn_size(a.callee) <
-                            get_callee_insn_size(b.callee);
+                     return a.insn_size < b.insn_size;
                    });
 
   std::vector<DexMethod*> inlined_callees;
   boost::optional<reg_t> cfg_next_caller_reg;
-  if (m_config.use_cfg_inliner && !m_config.unique_inlined_registers) {
+  if (!m_config.unique_inlined_registers) {
     cfg_next_caller_reg = caller->cfg().get_registers_size();
   }
-  size_t calls_not_inlinable{0}, calls_not_inlined{0};
-
-  std::unique_ptr<ab_test::ABExperimentContext> exp;
-  bool caller_had_editable_cfg = caller->editable_cfg_built();
-
-  if (for_speed()) {
-    if (!caller_had_editable_cfg) {
-      caller->build_cfg();
-    }
-    exp = ab_test::ABExperimentContext::create(&caller->cfg(), caller_method,
-                                               "pgi_v1");
-  }
+  size_t calls_not_inlinable{0}, calls_not_inlined{0}, no_returns{0},
+      unreachable_insns{0};
 
   size_t intermediate_shrinkings{0};
-  // We only try intermediate shrinking when using the cfg-inliner, as it will
-  // invalidate irlist iterators, which are used with the legacy
-  // non-cfg-inliner.
-  size_t last_intermediate_shrinking_inlined_callees{
-      (m_config.use_cfg_inliner && m_config.intermediate_shrinking)
-          ? 0
-          : std::numeric_limits<size_t>::max()};
-  if (exp) {
-    // Intermediate shrinking rebuilds the cfg, which is not currently supported
-    // by the AB experiment context. Thus, when an experiment is active, we
-    // effectively disable i
-    last_intermediate_shrinking_inlined_callees =
-        std::numeric_limits<size_t>::max();
-  }
+  size_t intermediate_remove_unreachable_blocks{0};
+  // We only try intermediate remove-unreachable-blocks or shrinking when using
+  // the cfg-inliner, as it will invalidate irlist iterators, which are used
+  // with the legacy non-cfg-inliner.
+  size_t last_intermediate_inlined_callees{0};
+
+  // Once blocks might have been freed, which can happen via
+  // remove_unreachable_blocks and shrinking, callsite pointers are no longer
+  // valid.
+  std::unique_ptr<std::unordered_set<const IRInstruction*>> remaining_callsites;
+  auto recompute_remaining_callsites = [caller, &remaining_callsites,
+                                        &ordered_inlinables]() {
+    if (!remaining_callsites) {
+      remaining_callsites =
+          std::make_unique<std::unordered_set<const IRInstruction*>>();
+      for (const auto& inlinable : ordered_inlinables) {
+        remaining_callsites->insert(inlinable.insn);
+      }
+    }
+    std::unordered_set<const IRInstruction*> new_remaining_callsites;
+    for (auto& mie : InstructionIterable(caller->cfg())) {
+      if (mie.insn->has_method() && remaining_callsites->count(mie.insn)) {
+        new_remaining_callsites.insert(mie.insn);
+      }
+    }
+    always_assert(new_remaining_callsites.size() <=
+                  remaining_callsites->size());
+    *remaining_callsites = std::move(new_remaining_callsites);
+  };
+
   for (const auto& inlinable : ordered_inlinables) {
     auto callee_method = inlinable.callee;
     auto callee = callee_method->get_code();
     auto callsite_insn = inlinable.insn;
+
+    if (remaining_callsites && !remaining_callsites->count(callsite_insn)) {
+      if (!inlinable.no_return) {
+        calls_not_inlined++;
+      }
+      continue;
+    }
+
+    if (inlinable.no_return) {
+      if (!m_config.throw_after_no_return) {
+        continue;
+      }
+      // we are not actually inlining, but just cutting off control-flow
+      // afterwards, inserting an (unreachable) "throw null" instruction
+      // sequence.
+      auto& caller_cfg = caller->cfg();
+      auto callsite_it = caller_cfg.find_insn(callsite_insn);
+      if (!callsite_it.is_end()) {
+        if (m_config.unique_inlined_registers) {
+          cfg_next_caller_reg = caller_cfg.get_registers_size();
+        }
+        auto temp_reg = *cfg_next_caller_reg;
+        if (temp_reg >= caller_cfg.get_registers_size()) {
+          caller_cfg.set_registers_size(temp_reg + 1);
+        }
+        // Copying to avoid cfg limitation
+        auto* callsite_copy = new IRInstruction(*callsite_it->insn);
+        auto* const_insn = (new IRInstruction(OPCODE_CONST))
+                               ->set_dest(temp_reg)
+                               ->set_literal(0);
+        auto* throw_insn =
+            (new IRInstruction(OPCODE_THROW))->set_src(0, temp_reg);
+        caller_cfg.replace_insns(callsite_it,
+                                 {callsite_copy, const_insn, throw_insn});
+        auto p = caller_cfg.remove_unreachable_blocks();
+        auto unreachable_insn_count = p.first;
+        auto registers_size_possibly_reduced = p.second;
+        if (registers_size_possibly_reduced &&
+            m_config.unique_inlined_registers) {
+          caller_cfg.recompute_registers_size();
+          cfg_next_caller_reg = caller_cfg.get_registers_size();
+        }
+        if (unreachable_insn_count) {
+          unreachable_insns += unreachable_insn_count;
+          recompute_remaining_callsites();
+        }
+        estimated_caller_size = caller_cfg.sum_opcode_sizes();
+        no_returns++;
+      }
+      continue;
+    }
 
     if (for_speed()) {
       // This is expensive, but with shrinking/non-cfg inlining prep there's no
@@ -877,21 +949,45 @@ void MultiMethodInliner::inline_inlinables(
 
     std::vector<DexMethod*> make_static;
     bool caller_too_large;
-    auto not_inlinable =
-        !is_inlinable(caller_method, callee_method, callsite_insn,
-                      estimated_insn_size, &make_static, &caller_too_large);
-    if (not_inlinable && caller_too_large && m_shrinker.enabled() &&
-        inlined_callees.size() > last_intermediate_shrinking_inlined_callees) {
-      always_assert(m_config.use_cfg_inliner);
-      always_assert(m_config.intermediate_shrinking);
-      intermediate_shrinkings++;
-      last_intermediate_shrinking_inlined_callees = inlined_callees.size();
-      m_shrinker.shrink_method(caller_method);
-      cfg_next_caller_reg = caller->cfg().get_registers_size();
-      estimated_insn_size = caller->cfg().sum_opcode_sizes();
-      not_inlinable =
-          !is_inlinable(caller_method, callee_method, callsite_insn,
-                        estimated_insn_size, &make_static, &caller_too_large);
+    auto not_inlinable = !is_inlinable(
+        caller_method, callee_method, callsite_insn, estimated_caller_size,
+        inlinable.insn_size, &make_static, &caller_too_large);
+    if (not_inlinable && caller_too_large &&
+        inlined_callees.size() > last_intermediate_inlined_callees) {
+      intermediate_remove_unreachable_blocks++;
+      last_intermediate_inlined_callees = inlined_callees.size();
+      auto p = caller->cfg().remove_unreachable_blocks();
+      unreachable_insns += p.first;
+      auto registers_size_possibly_reduced = p.second;
+      if (registers_size_possibly_reduced &&
+          m_config.unique_inlined_registers) {
+        caller->cfg().recompute_registers_size();
+        cfg_next_caller_reg = caller->cfg().get_registers_size();
+      }
+      estimated_caller_size = caller->cfg().sum_opcode_sizes();
+      recompute_remaining_callsites();
+      if (!remaining_callsites->count(callsite_insn)) {
+        calls_not_inlined++;
+        continue;
+      }
+      not_inlinable = !is_inlinable(caller_method, callee_method, callsite_insn,
+                                    estimated_caller_size, inlinable.insn_size,
+                                    &make_static, &caller_too_large);
+      if (!not_inlinable && m_config.intermediate_shrinking &&
+          m_shrinker.enabled()) {
+        intermediate_shrinkings++;
+        m_shrinker.shrink_method(caller_method);
+        cfg_next_caller_reg = caller->cfg().get_registers_size();
+        estimated_caller_size = caller->cfg().sum_opcode_sizes();
+        recompute_remaining_callsites();
+        if (!remaining_callsites->count(callsite_insn)) {
+          calls_not_inlined++;
+          continue;
+        }
+        not_inlinable = !is_inlinable(
+            caller_method, callee_method, callsite_insn, estimated_caller_size,
+            inlinable.insn_size, &make_static, &caller_too_large);
+      }
     }
     if (not_inlinable) {
       calls_not_inlinable++;
@@ -905,30 +1001,24 @@ void MultiMethodInliner::inline_inlinables(
           create_inlining_trace_msg(caller_method, callee_method, callsite_insn)
               .c_str());
 
-    if (m_config.use_cfg_inliner) {
-      if (m_config.unique_inlined_registers) {
-        cfg_next_caller_reg = caller->cfg().get_registers_size();
-      }
-      bool success = inliner::inline_with_cfg(
-          caller_method, callee_method, callsite_insn, *cfg_next_caller_reg);
-      if (!success) {
-        calls_not_inlined++;
-        continue;
-      }
-    } else {
-      // Logging before the call to inline_method to get the most relevant line
-      // number near callsite before callsite gets replaced. Should be ok as
-      // inline_method does not fail to inline.
-      log_opt(INLINED, caller_method, callsite_insn);
-
-      auto callsite = inlinable.iterator;
-      always_assert(callsite->insn == callsite_insn);
-      inliner::inline_method_unsafe(caller_method, caller, callee, callsite);
+    if (m_config.unique_inlined_registers) {
+      cfg_next_caller_reg = caller->cfg().get_registers_size();
+    }
+    auto timer2 = m_inline_with_cfg_timer.scope();
+    auto it = m_inlined_invokes_need_cast.find(callsite_insn);
+    auto needs_receiver_cast =
+        it == m_inlined_invokes_need_cast.end() ? nullptr : it->second;
+    bool success = inliner::inline_with_cfg(
+        caller_method, callee_method, callsite_insn, needs_receiver_cast,
+        *cfg_next_caller_reg, inlinable.dead_blocks);
+    if (!success) {
+      calls_not_inlined++;
+      continue;
     }
     TRACE(INL, 2, "caller: %s\tcallee: %s",
           caller->cfg_built() ? SHOW(caller->cfg()) : SHOW(caller),
           SHOW(callee));
-    estimated_insn_size += get_callee_insn_size(callee_method);
+    estimated_caller_size += inlinable.insn_size;
 
     inlined_callees.push_back(callee_method);
   }
@@ -954,14 +1044,6 @@ void MultiMethodInliner::inline_inlinables(
     code->clear_cfg();
   }
 
-  if (exp != nullptr) {
-    caller->cfg().simplify(); // Remove unreachable code.
-    exp->flush();
-    if (caller_had_editable_cfg) {
-      caller->build_cfg();
-    }
-  }
-
   info.calls_inlined += inlined_callees.size();
   if (calls_not_inlinable) {
     info.calls_not_inlinable += calls_not_inlinable;
@@ -969,120 +1051,74 @@ void MultiMethodInliner::inline_inlinables(
   if (calls_not_inlined) {
     info.calls_not_inlined += calls_not_inlined;
   }
+  if (no_returns) {
+    info.no_returns += no_returns;
+  }
+  if (unreachable_insns) {
+    info.unreachable_insns += unreachable_insns;
+  }
   if (intermediate_shrinkings) {
     info.intermediate_shrinkings += intermediate_shrinkings;
   }
-}
-
-void MultiMethodInliner::async_prioritized_method_execute(
-    DexMethod* method, const std::function<void()>& f) {
-  int priority = std::numeric_limits<int>::min();
-  auto it = m_async_callee_priorities.find(method);
-  if (it != m_async_callee_priorities.end()) {
-    priority = it->second;
+  if (intermediate_remove_unreachable_blocks) {
+    info.intermediate_remove_unreachable_blocks +=
+        intermediate_remove_unreachable_blocks;
   }
-  m_async_method_executor.post(priority, f);
-}
-
-void MultiMethodInliner::async_postprocess_method(DexMethod* method) {
-  if (m_async_callee_priorities.count(method) == 0 &&
-      (!m_shrinker.enabled() || method->rstate.no_optimizations())) {
-    return;
-  }
-
-  async_prioritized_method_execute(
-      method, [method, this]() { postprocess_method(method); });
 }
 
 void MultiMethodInliner::postprocess_method(DexMethod* method) {
   TraceContext context(method);
-  bool delayed_shrinking = false;
-  bool is_callee = !!m_async_callee_priorities.count(method);
   if (m_shrinker.enabled() && !method->rstate.no_optimizations()) {
-    if (is_callee && should_inline_fast(method)) {
-      // We know now that this method will get inlined regardless of the size
-      // of its code. Therefore, we can delay shrinking, to unblock further
-      // work more quickly.
-      delayed_shrinking = true;
-    } else {
-      m_shrinker.shrink_method(method);
-    }
+    m_shrinker.shrink_method(method);
   }
 
+  bool is_callee = !!callee_caller.count(method);
   if (!is_callee) {
     // This method isn't the callee of another caller, so we can stop here.
-    always_assert(!delayed_shrinking);
     return;
   }
 
-  // This pre-populates the
-  // - m_should_inline,
-  // - m_callee_insn_sizes, and
-  // - m_callee_type_refs
-  // - m_callee_caller_refs
-  // caches.
-  if (should_inline(method)) {
+  compute_callee_costs(method);
+}
+
+void MultiMethodInliner::compute_callee_costs(DexMethod* method) {
+  auto fully_inlined_cost = get_fully_inlined_cost(method);
+  always_assert(fully_inlined_cost);
+
+  auto callee_call_site_summary_occurrences_it =
+      m_callee_call_site_summary_occurrences.find(method);
+  if (callee_call_site_summary_occurrences_it !=
+          m_callee_call_site_summary_occurrences.end() &&
+      fully_inlined_cost->full_code <= MAX_COST_FOR_CONSTANT_PROPAGATION) {
+    const auto& callee_call_site_summary_occurrences =
+        callee_call_site_summary_occurrences_it->second;
+    for (auto& p : callee_call_site_summary_occurrences) {
+      m_scheduler.augment(
+          method, [this, call_site_summary = p.first, method]() {
+            TraceContext context(method);
+            // Populate cache
+            auto timer = m_call_site_inlined_cost_timer.scope();
+            get_call_site_inlined_cost(call_site_summary, method);
+          });
+    }
+  }
+
+  m_scheduler.augment(method, [this, method]() {
+    // Populate caches
     get_callee_insn_size(method);
     get_callee_type_refs(method);
-  }
+  });
 
-  auto& callers = m_async_callee_callers.at(method);
-  if (delayed_shrinking) {
-    m_async_delayed_shrinking_callee_wait_counts.emplace(method,
-                                                         callers.size());
-  }
-  decrement_caller_wait_counts(callers);
-}
-
-void MultiMethodInliner::decrement_caller_wait_counts(
-    const std::vector<DexMethod*>& callers) {
-  for (auto caller : callers) {
-    bool caller_ready = false;
-    m_async_caller_wait_counts.update(
-        caller, [&](const DexMethod*, size_t& value, bool /*exists*/) {
-          caller_ready = --value == 0;
-        });
-    if (caller_ready) {
-      if (inline_inlinables_need_deconstruct(caller)) {
-        // TODO: Support parallel execution without pre-deconstructed cfgs.
-        auto& callees = m_async_caller_callees.at(caller);
-        caller_inline(caller, callees);
-        decrement_delayed_shrinking_callee_wait_counts(callees);
-        async_postprocess_method(caller);
-      } else {
-        // We can process inlining concurrently!
-        async_prioritized_method_execute(caller, [caller, this]() {
-          auto& callees = m_async_caller_callees.at(caller);
-          caller_inline(caller, callees);
-          decrement_delayed_shrinking_callee_wait_counts(callees);
-          if (m_shrinker.enabled() ||
-              m_async_callee_priorities.count(caller) != 0) {
-            postprocess_method(caller);
-          }
-        });
-      }
-    }
-  }
-}
-
-void MultiMethodInliner::decrement_delayed_shrinking_callee_wait_counts(
-    const std::vector<DexMethod*>& callees) {
-  for (auto callee : callees) {
-    if (!m_async_delayed_shrinking_callee_wait_counts.count(callee)) {
-      continue;
-    }
-
-    bool callee_ready = false;
-    m_async_delayed_shrinking_callee_wait_counts.update(
-        callee, [&](const DexMethod*, size_t& value, bool /*exists*/) {
-          callee_ready = --value == 0;
-        });
-    if (callee_ready) {
-      int priority = std::numeric_limits<int>::min();
-      m_async_method_executor.post(
-          priority, [callee, this]() { m_shrinker.shrink_method(callee); });
-    }
-  }
+  // The should_inline_always caching depends on all other caches, so we augment
+  // it as a "continuation".
+  m_scheduler.augment(
+      method,
+      [this, method] {
+        TraceContext context(method);
+        // Populate cache
+        should_inline_always(method);
+      },
+      /* continuation */ true);
 }
 
 /**
@@ -1091,7 +1127,8 @@ void MultiMethodInliner::decrement_delayed_shrinking_callee_wait_counts(
 bool MultiMethodInliner::is_inlinable(const DexMethod* caller,
                                       const DexMethod* callee,
                                       const IRInstruction* insn,
-                                      size_t estimated_insn_size,
+                                      uint64_t estimated_caller_size,
+                                      uint64_t estimated_callee_size,
                                       std::vector<DexMethod*>* make_static,
                                       bool* caller_too_large_) {
   TraceContext context{caller};
@@ -1153,7 +1190,8 @@ bool MultiMethodInliner::is_inlinable(const DexMethod* caller,
       return false;
     }
 
-    if (caller_too_large(caller->get_class(), estimated_insn_size, callee)) {
+    if (caller_too_large(caller->get_class(), estimated_caller_size,
+                         estimated_callee_size)) {
       if (insn) {
         log_nopt(INL_TOO_BIG, caller, insn);
       }
@@ -1196,13 +1234,13 @@ bool MultiMethodInliner::is_blocklisted(const DexMethod* callee) {
 }
 
 bool MultiMethodInliner::is_estimate_over_max(uint64_t estimated_caller_size,
-                                              const DexMethod* callee,
+                                              uint64_t estimated_callee_size,
                                               uint64_t max) {
   // INSTRUCTION_BUFFER is added because the final method size is often larger
   // than our estimate -- during the sync phase, we may have to pick larger
   // branch opcodes to encode large jumps.
-  auto callee_size = get_callee_insn_size(callee);
-  if (estimated_caller_size + callee_size > max - INSTRUCTION_BUFFER) {
+  if (estimated_caller_size + estimated_callee_size >
+      max - std::min(m_config.instruction_size_buffer, max)) {
     info.caller_too_large++;
     return true;
   }
@@ -1210,9 +1248,9 @@ bool MultiMethodInliner::is_estimate_over_max(uint64_t estimated_caller_size,
 }
 
 bool MultiMethodInliner::caller_too_large(DexType* caller_type,
-                                          size_t estimated_caller_size,
-                                          const DexMethod* callee) {
-  if (is_estimate_over_max(estimated_caller_size, callee,
+                                          uint64_t estimated_caller_size,
+                                          uint64_t estimated_callee_size) {
+  if (is_estimate_over_max(estimated_caller_size, estimated_callee_size,
                            HARD_MAX_INSTRUCTION_SIZE)) {
     return true;
   }
@@ -1225,8 +1263,8 @@ bool MultiMethodInliner::caller_too_large(DexType* caller_type,
     return false;
   }
 
-  if (is_estimate_over_max(estimated_caller_size, callee,
-                           SOFT_MAX_INSTRUCTION_SIZE)) {
+  if (is_estimate_over_max(estimated_caller_size, estimated_callee_size,
+                           m_config.soft_max_instruction_size)) {
     return true;
   }
 
@@ -1244,22 +1282,19 @@ bool MultiMethodInliner::should_inline_fast(const DexMethod* callee) {
     return true;
   }
 
-  const auto& callers = callee_caller.at(callee);
-  auto caller_count = callers.size();
-  always_assert(caller_count > 0);
-
-  // non-root methods that are only ever called as often as there are
-  // "same methods" (usually once) should always be inlined,
+  // non-root methods that are only ever called once should always be inlined,
   // as the method can be removed afterwards
-  if (caller_count <= get_same_method_implementations(callee) &&
-      !root(callee)) {
+  const auto& callers = callee_caller.at(callee);
+  if (callers.size() == 1 && callers.begin()->second == 1 && !root(callee) &&
+      !m_recursive_callees.count(callee) && !m_x_dex_callees.count(callee) &&
+      !m_true_virtual_callees_with_other_call_sites.count(callee)) {
     return true;
   }
 
   return false;
 }
 
-bool MultiMethodInliner::should_inline(const DexMethod* callee) {
+bool MultiMethodInliner::should_inline_always(const DexMethod* callee) {
   if (should_inline_fast(callee)) {
     return true;
   }
@@ -1315,10 +1350,8 @@ static size_t get_inlined_regs_cost(size_t regs) {
   return cost;
 }
 
-static size_t get_invoke_cost(const DexMethod* callee) {
-  size_t invoke_cost = callee->get_proto()->is_void()
-                           ? COST_INVOKE_WITHOUT_RESULT
-                           : COST_INVOKE_WITH_RESULT;
+static float get_invoke_cost(const DexMethod* callee, float result_used) {
+  float invoke_cost = COST_INVOKE + result_used * COST_MOVE_RESULT;
   invoke_cost += get_inlined_regs_cost(callee->get_proto()->get_args()->size());
   return invoke_cost;
 }
@@ -1417,56 +1450,72 @@ struct ResidualCfgInfo {
 
 static boost::optional<ResidualCfgInfo> get_residual_cfg_info(
     bool is_static,
+    bool has_result,
     const IRCode* code,
-    const ConstantArguments* constant_arguments,
+    const CallSiteSummary* call_site_summary,
     const std::unordered_set<DexMethodRef*>* pure_methods,
     constant_propagation::ImmutableAttributeAnalyzerState*
         immut_analyzer_state) {
-  auto& cfg = code->cfg();
-  if (!constant_arguments || constant_arguments->is_top()) {
+  if (!call_site_summary) {
     return boost::none;
   }
 
-  constant_propagation::intraprocedural::FixpointIterator intra_cp(
-      cfg,
-      constant_propagation::ConstantPrimitiveAndBoxedAnalyzer(
-          immut_analyzer_state, immut_analyzer_state,
-          constant_propagation::EnumFieldAnalyzerState::get(),
-          constant_propagation::BoxedBooleanAnalyzerState::get(), nullptr));
-  ConstantEnvironment initial_env =
-      constant_propagation::interprocedural::env_with_params(
-          is_static, code, *constant_arguments);
-  intra_cp.run(initial_env);
-
-  ResidualCfgInfo res;
-  res.reachable_blocks = graph::postorder_sort<cfg::GraphInterface>(cfg);
-  bool found_unreachable_block_or_infeasible_edge{false};
-  for (auto it = res.reachable_blocks.begin();
-       it != res.reachable_blocks.end();) {
-    cfg::Block* block = *it;
-    if (intra_cp.get_entry_state_at(block).is_bottom()) {
-      // we found an unreachable block
-      found_unreachable_block_or_infeasible_edge = true;
-      it = res.reachable_blocks.erase(it);
-    } else {
-      auto env = intra_cp.get_exit_state_at(block);
-      std::vector<cfg::Edge*>& block_feasible_succs = res.feasible_succs[block];
-      for (auto succ : block->succs()) {
-        if (succ->type() == cfg::EDGE_GHOST) {
-          continue;
-        }
-        if (intra_cp.analyze_edge(succ, env).is_bottom()) {
-          // we found an infeasible edge
-          found_unreachable_block_or_infeasible_edge = true;
-          continue;
-        }
-        block_feasible_succs.push_back(succ);
-      }
-      ++it;
+  auto& cfg = code->cfg();
+  if (call_site_summary->arguments.is_top()) {
+    if (!has_result || call_site_summary->result_used) {
+      return boost::none;
     }
   }
-  if (!found_unreachable_block_or_infeasible_edge) {
-    return boost::none;
+
+  ResidualCfgInfo res;
+  if (call_site_summary->arguments.is_top()) {
+    res.reachable_blocks = cfg.blocks();
+    for (auto block : res.reachable_blocks) {
+      res.feasible_succs.emplace(block, block->succs());
+    }
+  } else {
+    constant_propagation::intraprocedural::FixpointIterator intra_cp(
+        cfg,
+        constant_propagation::ConstantPrimitiveAndBoxedAnalyzer(
+            immut_analyzer_state, immut_analyzer_state,
+            constant_propagation::EnumFieldAnalyzerState::get(),
+            constant_propagation::BoxedBooleanAnalyzerState::get(), nullptr));
+    ConstantEnvironment initial_env =
+        constant_propagation::interprocedural::env_with_params(
+            is_static, code, call_site_summary->arguments);
+    intra_cp.run(initial_env);
+
+    res.reachable_blocks = graph::postorder_sort<cfg::GraphInterface>(cfg);
+    bool found_unreachable_block_or_infeasible_edge{false};
+    for (auto it = res.reachable_blocks.begin();
+         it != res.reachable_blocks.end();) {
+      cfg::Block* block = *it;
+      if (intra_cp.get_entry_state_at(block).is_bottom()) {
+        // we found an unreachable block
+        found_unreachable_block_or_infeasible_edge = true;
+        it = res.reachable_blocks.erase(it);
+      } else {
+        auto env = intra_cp.get_exit_state_at(block);
+        std::vector<cfg::Edge*>& block_feasible_succs =
+            res.feasible_succs[block];
+        for (auto succ : block->succs()) {
+          if (succ->type() == cfg::EDGE_GHOST) {
+            continue;
+          }
+          if (intra_cp.analyze_edge(succ, env).is_bottom()) {
+            // we found an infeasible edge
+            found_unreachable_block_or_infeasible_edge = true;
+            continue;
+          }
+          block_feasible_succs.push_back(succ);
+        }
+        ++it;
+      }
+    }
+    if (!found_unreachable_block_or_infeasible_edge &&
+        (!has_result || call_site_summary->result_used)) {
+      return boost::none;
+    }
   }
 
   static std::unordered_set<DexMethodRef*> no_pure_methods;
@@ -1479,11 +1528,15 @@ static boost::optional<ResidualCfgInfo> get_residual_cfg_info(
            },
            /* may_be_required_fn */
            [&](cfg::Block*block, IRInstruction*insn) -> bool {
-             if (!opcode::is_switch(insn->opcode()) &&
-                 !opcode::is_a_conditional_branch(insn->opcode())) {
-               return true;
+             if (opcode::is_switch(insn->opcode()) ||
+                 opcode::is_a_conditional_branch(insn->opcode())) {
+               return res.feasible_succs.at(block).size() > 1;
              }
-             return res.feasible_succs.at(block).size() > 1;
+             if (opcode::is_a_return(insn->opcode()) &&
+                 !call_site_summary->result_used) {
+               return false;
+             }
+             return true;
            })) {
     res.dead_instructions.insert(p.second->insn);
   }
@@ -1493,25 +1546,21 @@ static boost::optional<ResidualCfgInfo> get_residual_cfg_info(
   return res;
 }
 
-struct InlinedCostAndDeadBlocks {
-  InlinedCost inlined_cost;
-  size_t dead_blocks;
-};
-
 /*
  * Try to estimate number of code units (2 bytes each) of code. Also take
  * into account costs arising from control-flow overhead and constant
  * arguments, if any
  */
-static InlinedCostAndDeadBlocks get_inlined_cost(
+static InlinedCost get_inlined_cost(
     bool is_static,
+    bool has_result,
     const IRCode* code,
-    const ConstantArguments* constant_arguments = nullptr,
+    const CallSiteSummary* call_site_summary = nullptr,
     const std::unordered_set<DexMethodRef*>* pure_methods = nullptr,
     constant_propagation::ImmutableAttributeAnalyzerState*
         immut_analyzer_state = nullptr) {
   size_t cost{0};
-  size_t dead_blocks{0};
+  std::unordered_set<cfg::Block*> dead_blocks;
   size_t returns{0};
   std::unordered_set<DexMethodRef*> method_refs_set;
   std::unordered_set<const void*> other_refs_set;
@@ -1536,12 +1585,23 @@ static InlinedCostAndDeadBlocks get_inlined_cost(
       }
     }
   };
+  size_t insn_size{0};
   if (code->editable_cfg_built()) {
-    auto rcfg = get_residual_cfg_info(is_static, code, constant_arguments,
-                                      pure_methods, immut_analyzer_state);
+    auto rcfg =
+        get_residual_cfg_info(is_static, has_result, code, call_site_summary,
+                              pure_methods, immut_analyzer_state);
     const auto& reachable_blocks =
         rcfg ? rcfg->reachable_blocks : code->cfg().blocks();
-    dead_blocks += code->cfg().blocks().size() - reachable_blocks.size();
+    auto cfg_blocks = code->cfg().blocks();
+    if (reachable_blocks.size() < cfg_blocks.size()) {
+      std::unordered_set<cfg::Block*> reachable_block_set(
+          reachable_blocks.begin(), reachable_blocks.end());
+      for (auto block : cfg_blocks) {
+        if (!reachable_block_set.count(block)) {
+          dead_blocks.insert(block);
+        }
+      }
+    }
 
     for (size_t i = 0; i < reachable_blocks.size(); ++i) {
       auto block = reachable_blocks.at(i);
@@ -1551,14 +1611,15 @@ static InlinedCostAndDeadBlocks get_inlined_cost(
           continue;
         }
         cost += get_inlined_cost(insn);
-        if (opcode::is_a_return(insn->opcode())) {
-          returns++;
-        }
         analyze_refs(insn);
+        insn_size += insn->size();
       }
       const auto& feasible_succs =
           rcfg ? rcfg->feasible_succs.at(block) : block->succs();
       cost += get_inlined_cost(reachable_blocks, i, feasible_succs);
+      if (block->branchingness() == opcode::Branchingness::BRANCH_RETURN) {
+        returns++;
+      }
     }
   } else {
     editable_cfg_adapter::iterate(code, [&](const MethodItemEntry& mie) {
@@ -1570,6 +1631,7 @@ static InlinedCostAndDeadBlocks get_inlined_cost(
       analyze_refs(insn);
       return editable_cfg_adapter::LOOP_CONTINUE;
     });
+    insn_size = code->sum_opcode_sizes();
   }
   if (returns > 1) {
     // if there's more than one return, gotos will get introduced to merge
@@ -1577,92 +1639,184 @@ static InlinedCostAndDeadBlocks get_inlined_cost(
     cost += returns - 1;
   }
 
-  return {{cost, method_refs_set.size(), other_refs_set.size()}, dead_blocks};
+  auto result_used =
+      call_site_summary ? call_site_summary->result_used : has_result;
+
+  return (InlinedCost){cost,
+                       (float)cost,
+                       (float)method_refs_set.size(),
+                       (float)other_refs_set.size(),
+                       !returns,
+                       (float)result_used,
+                       std::move(dead_blocks),
+                       insn_size};
 }
 
-InlinedCost MultiMethodInliner::get_inlined_cost(const DexMethod* callee) {
-  auto opt_inlined_cost = m_inlined_costs.get(callee, boost::none);
-  if (opt_inlined_cost) {
-    return *opt_inlined_cost;
+const InlinedCost* MultiMethodInliner::get_fully_inlined_cost(
+    const DexMethod* callee) {
+  auto inlined_cost = m_fully_inlined_costs.get(callee, nullptr);
+  if (inlined_cost) {
+    return inlined_cost.get();
   }
-
-  std::mutex mutex;
-  size_t callees_analyzed{0};
-  size_t callees_unreachable_blocks{0};
-  InlinedCost inlined_cost{
-      ::get_inlined_cost(is_static(callee), callee->get_code()).inlined_cost};
-  std::unordered_map<std::string, InlinedCost> inlined_costs_keyed;
-  auto callee_constant_arguments_it = m_callee_constant_arguments.find(callee);
-  if (callee_constant_arguments_it != m_callee_constant_arguments.end() &&
-      inlined_cost.code <= MAX_COST_FOR_CONSTANT_PROPAGATION) {
-    const auto& callee_constant_arguments =
-        callee_constant_arguments_it->second;
-    auto process_key = [&](const ConstantArgumentsOccurrences& cao) {
-      TraceContext context(callee);
-      const auto& constant_arguments = cao.first;
-      const auto count = cao.second;
-      TRACE(INLINE, 5, "[too_many_callers] get_inlined_cost %s", SHOW(callee));
-      auto res = ::get_inlined_cost(is_static(callee), callee->get_code(),
-                                    &constant_arguments,
-                                    &m_shrinker.get_pure_methods(),
-                                    m_shrinker.get_immut_analyzer_state());
-      TRACE(INLINE, 4,
-            "[too_many_callers] get_inlined_cost with %zu constant invoke "
-            "params %s @ %s: cost %zu, method refs %zu, other refs %zu (dead "
-            "blocks: %zu)",
-            constant_arguments.is_top() ? 0 : constant_arguments.size(),
-            get_key(constant_arguments).c_str(), SHOW(callee),
-            res.inlined_cost.code, res.inlined_cost.method_refs,
-            res.inlined_cost.other_refs, res.dead_blocks);
-      std::lock_guard<std::mutex> lock_guard(mutex);
-      callees_unreachable_blocks += res.dead_blocks * count;
-      inlined_cost.code += res.inlined_cost.code * count;
-      inlined_cost.method_refs += res.inlined_cost.method_refs * count;
-      inlined_cost.other_refs += res.inlined_cost.other_refs * count;
-      callees_analyzed += count;
-      inlined_costs_keyed.emplace(get_key(constant_arguments),
-                                  res.inlined_cost);
-    };
-
-    if (callee_constant_arguments.size() > 1 &&
-        callee_constant_arguments.size() * inlined_cost.code >=
-            MIN_COST_FOR_PARALLELIZATION) {
-      // TODO: This parallelization happens independently (in addition to) the
-      // parallelization via m_async_method_executor. This should be combined,
-      // using a single thread pool.
-      inlined_cost = {0, 0, 0};
-      auto num_threads = std::min(redex_parallel::default_num_threads(),
-                                  callee_constant_arguments.size());
-      workqueue_run<ConstantArgumentsOccurrences>(
-          process_key, callee_constant_arguments, num_threads);
-    } else {
-      inlined_cost = {0, 0, 0};
-      for (auto& p : callee_constant_arguments) {
-        process_key(p);
-      }
-    }
-
-    always_assert(callees_analyzed > 0);
-    // compute average costs, rounding up to be conservative
-    inlined_cost = {
-        (inlined_cost.code + callees_analyzed - 1) / callees_analyzed,
-        (inlined_cost.method_refs + callees_analyzed - 1) / callees_analyzed,
-        (inlined_cost.other_refs + callees_analyzed - 1) / callees_analyzed};
-    m_inlined_costs_keyed.emplace(
-        callee, std::make_shared<std::unordered_map<std::string, InlinedCost>>(
-                    inlined_costs_keyed.begin(), inlined_costs_keyed.end()));
-  }
-  TRACE(INLINE, 4, "[too_many_callers] get_inlined_cost %s: {%zu,%zu,%zu}",
-        SHOW(callee), inlined_cost.code, inlined_cost.method_refs,
-        inlined_cost.other_refs);
-  m_inlined_costs.update(
+  bool callee_is_static = is_static(callee);
+  bool callee_has_result = !callee->get_proto()->is_void();
+  inlined_cost = std::make_shared<InlinedCost>(get_inlined_cost(
+      callee_is_static, callee_has_result, callee->get_code()));
+  TRACE(INLINE, 4, "get_fully_inlined_cost(%s) = {%zu,%f,%f,%f,%s,%f,%zu,%zu}",
+        SHOW(callee), inlined_cost->full_code, inlined_cost->code,
+        inlined_cost->method_refs, inlined_cost->other_refs,
+        inlined_cost->no_return ? "no_return" : "return",
+        inlined_cost->result_used, inlined_cost->dead_blocks.size(),
+        inlined_cost->insn_size);
+  m_fully_inlined_costs.update(
       callee,
-      [&](const DexMethod*, boost::optional<InlinedCost>& value, bool exists) {
+      [&](const DexMethod*, std::shared_ptr<InlinedCost>& value, bool exists) {
         if (exists) {
           // We wasted some work, and some other thread beat us. Oh well...
-          always_assert(value->code == inlined_cost.code);
-          always_assert(value->method_refs == inlined_cost.method_refs);
-          always_assert(value->other_refs == inlined_cost.other_refs);
+          always_assert(*value == *inlined_cost);
+          inlined_cost = value;
+          return;
+        }
+        value = inlined_cost;
+      });
+
+  return inlined_cost.get();
+}
+
+const InlinedCost* MultiMethodInliner::get_call_site_inlined_cost(
+    const IRInstruction* invoke_insn, const DexMethod* callee) {
+  auto it = m_invoke_call_site_summaries.find(invoke_insn);
+  if (it == m_invoke_call_site_summaries.end()) {
+    return nullptr;
+  }
+  auto& call_site_summary = it->second;
+  return get_call_site_inlined_cost(call_site_summary, callee);
+}
+
+const InlinedCost* MultiMethodInliner::get_call_site_inlined_cost(
+    const CallSiteSummary& call_site_summary, const DexMethod* callee) {
+  auto callee_call_site_summary_occurrences_it =
+      m_callee_call_site_summary_occurrences.find(callee);
+  if (callee_call_site_summary_occurrences_it ==
+      m_callee_call_site_summary_occurrences.end()) {
+    return nullptr;
+  }
+  auto fully_inlined_cost = get_fully_inlined_cost(callee);
+  always_assert(fully_inlined_cost);
+  if (fully_inlined_cost->full_code > MAX_COST_FOR_CONSTANT_PROPAGATION) {
+    return nullptr;
+  }
+
+  auto key = show(callee) + " ** " + get_key(call_site_summary);
+  auto inlined_cost = m_call_site_inlined_costs.get(key, nullptr);
+  if (inlined_cost) {
+    return inlined_cost.get();
+  }
+
+  bool callee_is_static = is_static(callee);
+  bool callee_has_result = !callee->get_proto()->is_void();
+  inlined_cost = std::make_shared<InlinedCost>(
+      get_inlined_cost(callee_is_static, callee_has_result, callee->get_code(),
+                       &call_site_summary, &m_shrinker.get_pure_methods(),
+                       m_shrinker.get_immut_analyzer_state()));
+  TRACE(INLINE, 4,
+        "get_call_site_inlined_cost(%s) = {%zu,%f,%f,%f,%s,%f,%zu,%zu}",
+        key.c_str(), inlined_cost->full_code, inlined_cost->code,
+        inlined_cost->method_refs, inlined_cost->other_refs,
+        inlined_cost->no_return ? "no_return" : "return",
+        inlined_cost->result_used, inlined_cost->dead_blocks.size(),
+        inlined_cost->insn_size);
+  m_call_site_inlined_costs.update(key,
+                                   [&](const std::string&,
+                                       std::shared_ptr<InlinedCost>& value,
+                                       bool exists) {
+                                     if (exists) {
+                                       // We wasted some work, and some other
+                                       // thread beat us. Oh well...
+                                       always_assert(*value == *inlined_cost);
+                                       inlined_cost = value;
+                                       return;
+                                     }
+                                     value = inlined_cost;
+                                   });
+
+  return inlined_cost.get();
+}
+
+const InlinedCost* MultiMethodInliner::get_average_inlined_cost(
+    const DexMethod* callee) {
+  auto inlined_cost = m_average_inlined_costs.get(callee, nullptr);
+  if (inlined_cost) {
+    return inlined_cost.get();
+  }
+
+  auto fully_inlined_cost = get_fully_inlined_cost(callee);
+  always_assert(fully_inlined_cost);
+
+  size_t callees_analyzed{0};
+  size_t callees_unreachable_blocks{0};
+  size_t callees_unused_results{0};
+  size_t callees_no_return{0};
+
+  auto callee_call_site_summary_occurrences_it =
+      m_callee_call_site_summary_occurrences.find(callee);
+  if (callee_call_site_summary_occurrences_it ==
+          m_callee_call_site_summary_occurrences.end() ||
+      fully_inlined_cost->full_code > MAX_COST_FOR_CONSTANT_PROPAGATION) {
+    inlined_cost = std::make_shared<InlinedCost>(*fully_inlined_cost);
+  } else {
+    inlined_cost = std::make_shared<InlinedCost>((InlinedCost){
+        fully_inlined_cost->full_code, 0.0f, 0.0f, 0.0f, true, 0.0f, {}, 0});
+    bool callee_has_result = !callee->get_proto()->is_void();
+    const auto& callee_call_site_summary_occurrences =
+        callee_call_site_summary_occurrences_it->second;
+    for (auto& p : callee_call_site_summary_occurrences) {
+      const auto& call_site_summary = p.first;
+      const auto count = p.second;
+      auto call_site_inlined_cost =
+          get_call_site_inlined_cost(call_site_summary, callee);
+      always_assert(call_site_inlined_cost);
+      callees_unreachable_blocks +=
+          call_site_inlined_cost->dead_blocks.size() * count;
+      if (callee_has_result && !call_site_summary.result_used) {
+        callees_unused_results += count;
+      }
+      inlined_cost->code += call_site_inlined_cost->code * count;
+      inlined_cost->method_refs += call_site_inlined_cost->method_refs * count;
+      inlined_cost->other_refs += call_site_inlined_cost->other_refs * count;
+      inlined_cost->result_used += call_site_inlined_cost->result_used * count;
+      if (call_site_inlined_cost->no_return) {
+        callees_no_return++;
+      } else {
+        inlined_cost->no_return = false;
+      }
+      if (call_site_inlined_cost->insn_size > inlined_cost->insn_size) {
+        inlined_cost->insn_size = call_site_inlined_cost->insn_size;
+      }
+      callees_analyzed += count;
+    };
+
+    always_assert(callees_analyzed > 0);
+    // compute average costs
+    inlined_cost->code /= callees_analyzed;
+    inlined_cost->method_refs /= callees_analyzed;
+    inlined_cost->other_refs /= callees_analyzed;
+    inlined_cost->result_used /= callees_analyzed;
+  }
+  TRACE(INLINE, 4,
+        "get_average_inlined_cost(%s) = {%zu,%f,%f,%f,%s,%f,%zu,%zu}",
+        SHOW(callee), inlined_cost->full_code, inlined_cost->code,
+        inlined_cost->method_refs, inlined_cost->other_refs,
+        inlined_cost->no_return ? "no_return" : "return",
+        inlined_cost->result_used, inlined_cost->dead_blocks.size(),
+        inlined_cost->insn_size);
+  m_average_inlined_costs.update(
+      callee,
+      [&](const DexMethod*, std::shared_ptr<InlinedCost>& value, bool exists) {
+        if (exists) {
+          // We wasted some work, and some other thread beat us. Oh well...
+          always_assert(*value == *inlined_cost);
+          inlined_cost = value;
           return;
         }
         value = inlined_cost;
@@ -1672,21 +1826,10 @@ InlinedCost MultiMethodInliner::get_inlined_cost(const DexMethod* callee) {
         info.constant_invoke_callees_analyzed += callees_analyzed;
         info.constant_invoke_callees_unreachable_blocks +=
             callees_unreachable_blocks;
+        info.constant_invoke_callees_unused_results += callees_unused_results;
+        info.constant_invoke_callees_no_return += callees_no_return;
       });
-  return inlined_cost;
-}
-
-size_t MultiMethodInliner::get_same_method_implementations(
-    const DexMethod* callee) {
-  if (m_same_method_implementations == nullptr) {
-    return 1;
-  }
-
-  auto it = m_same_method_implementations->find(callee);
-  if (it != m_same_method_implementations->end()) {
-    return it->second;
-  }
-  return 1;
+  return inlined_cost.get();
 }
 
 bool MultiMethodInliner::can_inline_init(const DexMethod* init_method) {
@@ -1712,58 +1855,14 @@ bool MultiMethodInliner::can_inline_init(const DexMethod* init_method) {
 }
 
 bool MultiMethodInliner::too_many_callers(const DexMethod* callee) {
+  if (root(callee) || m_recursive_callees.count(callee) ||
+      m_x_dex_callees.count(callee) ||
+      m_true_virtual_callees_with_other_call_sites.count(callee) ||
+      !m_config.multiple_callers) {
+    return true;
+  }
+
   const auto& callers = callee_caller.at(callee);
-  auto caller_count = callers.size();
-  always_assert(caller_count > 0);
-  auto same_method_implementations = get_same_method_implementations(callee);
-  always_assert(caller_count > same_method_implementations || root(callee));
-
-  // 1. Determine costs of inlining
-
-  auto inlined_cost = get_inlined_cost(callee);
-
-  boost::optional<CalleeCallerRefs> callee_caller_refs;
-  size_t cross_dex_penalty{0};
-  if (m_mode != IntraDex && !is_private(callee)) {
-    callee_caller_refs = get_callee_caller_refs(callee);
-    if (callee_caller_refs->same_class) {
-      callee_caller_refs = boost::none;
-    } else {
-      // Inlining methods into different classes might lead to worse
-      // cross-dex-ref minimization results.
-      cross_dex_penalty = inlined_cost.method_refs;
-      if (callee_caller_refs->classes > 1 &&
-          (inlined_cost.method_refs + inlined_cost.other_refs) > 0) {
-        cross_dex_penalty++;
-      }
-      inlined_cost.code += cross_dex_penalty;
-    }
-  }
-
-  // 2. Determine costs of keeping the invoke instruction
-
-  size_t invoke_cost = get_invoke_cost(callee);
-  TRACE(INLINE, 3,
-        "[too_many_callers] %zu calls to %s; cost: inlined %zu, invoke %zu",
-        caller_count, SHOW(callee), inlined_cost.code, invoke_cost);
-
-  // 3. Assess whether we should not inline
-
-  if (root(callee)) {
-    if (m_config.inline_small_non_deletables) {
-      // Let's just consider this particular inlining opportunity
-      return inlined_cost.code > invoke_cost;
-    } else {
-      return true;
-    }
-  }
-
-  // Let's just consider this particular inlining opportunity
-  if (inlined_cost.code <= invoke_cost) {
-    return false;
-  }
-
-  std::unordered_set<DexMethod*> callers_set(callers.begin(), callers.end());
 
   // Can we inline the init-callee into all callers?
   // If not, then we can give up, as there's no point in making the case that
@@ -1773,7 +1872,8 @@ bool MultiMethodInliner::too_many_callers(const DexMethod* callee) {
       return true;
     }
     if (!can_inline_init(callee)) {
-      for (auto caller : callers_set) {
+      for (auto& p : callers) {
+        auto caller = p.first;
         if (!method::is_init(caller) ||
             caller->get_class() != callee->get_class() ||
             !caller->get_code()->editable_cfg_built() ||
@@ -1786,72 +1886,104 @@ bool MultiMethodInliner::too_many_callers(const DexMethod* callee) {
     }
   }
 
-  if (m_config.multiple_callers) {
-    size_t classes = callee_caller_refs ? callee_caller_refs->classes : 0;
+  // 1. Determine costs of inlining
 
-    // The cost of keeping a method amounts of somewhat fixed metadata overhead,
-    // plus the method body, which we approximate with the inlined cost.
-    size_t method_cost = COST_METHOD + get_inlined_cost(callee).code;
-    auto methods_cost = method_cost * same_method_implementations;
+  auto inlined_cost = get_average_inlined_cost(callee);
+  always_assert(inlined_cost);
 
-    // If we inline invocations to this method everywhere, we could delete the
-    // method. Is this worth it, given the number of callsites and costs
-    // involved?
-    if ((inlined_cost.code - cross_dex_penalty) * caller_count +
-            classes * cross_dex_penalty >
-        invoke_cost * caller_count + methods_cost) {
-      return true;
-    }
-
-    // We can't eliminate the method entirely if it's not inlinable
-    for (auto caller : callers_set) {
-      if (!is_inlinable(caller, callee, /* insn */ nullptr,
-                        /* estimated_insn_size */ 0,
-                        /* make_static */ nullptr)) {
-        return true;
+  boost::optional<CalleeCallerRefs> callee_caller_refs;
+  float cross_dex_penalty{0};
+  if (m_mode != IntraDex && !is_private(callee)) {
+    callee_caller_refs = get_callee_caller_refs(callee);
+    if (callee_caller_refs->same_class) {
+      callee_caller_refs = boost::none;
+    } else {
+      // Inlining methods into different classes might lead to worse
+      // cross-dex-ref minimization results.
+      cross_dex_penalty = inlined_cost->method_refs;
+      if (callee_caller_refs->classes > 1 &&
+          (inlined_cost->method_refs + inlined_cost->other_refs) > 0) {
+        cross_dex_penalty++;
       }
     }
-
-    return false;
   }
 
-  return true;
+  // 2. Determine costs of keeping the invoke instruction
+
+  size_t caller_count{0};
+  for (auto& p : callers) {
+    caller_count += p.second;
+  }
+  float invoke_cost = get_invoke_cost(callee, inlined_cost->result_used);
+  TRACE(INLINE, 3,
+        "[too_many_callers] %zu calls to %s; cost: inlined %f + %f, invoke %f",
+        caller_count, SHOW(callee), inlined_cost->code, cross_dex_penalty,
+        invoke_cost);
+
+  size_t classes = callee_caller_refs ? callee_caller_refs->classes : 0;
+
+  // The cost of keeping a method amounts of somewhat fixed metadata overhead,
+  // plus the method body, which we approximate with the inlined cost.
+  size_t method_cost = COST_METHOD + inlined_cost->full_code;
+  auto methods_cost = method_cost;
+
+  // If we inline invocations to this method everywhere, we could delete the
+  // method. Is this worth it, given the number of callsites and costs
+  // involved?
+  if (inlined_cost->code * caller_count + classes * cross_dex_penalty >
+      invoke_cost * caller_count + methods_cost) {
+    return true;
+  }
+
+  // We can't eliminate the method entirely if it's not inlinable
+  for (auto& p : callers) {
+    auto caller = p.first;
+    // We can't account here in detail for the caller and callee size. We hope
+    // for the best, and assume that the caller is empty, and we'll use the
+    // (maximum) insn_size for all inlined-costs. We'll check later again at
+    // each individual call-site whether the size limits hold.
+    if (!is_inlinable(caller, callee, /* insn */ nullptr,
+                      /* estimated_caller_size */ 0,
+                      /* estimated_callee_size */ inlined_cost->insn_size,
+                      /* make_static */ nullptr)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
-bool MultiMethodInliner::should_inline_optional(
-    DexMethod* caller, const IRInstruction* invoke_insn, DexMethod* callee) {
-  if (!m_call_constant_arguments.count_unsafe(invoke_insn)) {
+bool MultiMethodInliner::should_inline_at_call_site(
+    DexMethod* caller,
+    const IRInstruction* invoke_insn,
+    DexMethod* callee,
+    bool* no_return,
+    const std::unordered_set<cfg::Block*>** dead_blocks,
+    size_t* insn_size) {
+  auto inlined_cost = get_call_site_inlined_cost(invoke_insn, callee);
+  if (!inlined_cost) {
     return false;
   }
-  auto& constant_arguments = m_call_constant_arguments.at_unsafe(invoke_insn);
-  auto opt_inlined_costs_keyed = m_inlined_costs_keyed.get(
-      callee, std::shared_ptr<std::unordered_map<std::string, InlinedCost>>());
-  if (!opt_inlined_costs_keyed) {
-    return false;
-  }
-  auto key = get_key(constant_arguments);
-  auto it = opt_inlined_costs_keyed->find(key);
-  if (it == opt_inlined_costs_keyed->end()) {
-    return false;
-  }
-  auto inlined_cost = it->second;
 
+  float cross_dex_penalty{0};
   if (m_mode != IntraDex && !is_private(callee) &&
       caller->get_class() != callee->get_class()) {
     // Inlining methods into different classes might lead to worse
     // cross-dex-ref minimization results.
-    size_t cross_dex_penalty = inlined_cost.method_refs;
-    if (inlined_cost.method_refs + inlined_cost.other_refs > 0) {
+    cross_dex_penalty = inlined_cost->method_refs;
+    if (inlined_cost->method_refs + inlined_cost->other_refs > 0) {
       cross_dex_penalty++;
     }
-    inlined_cost.code += cross_dex_penalty;
   }
 
-  size_t invoke_cost = get_invoke_cost(callee);
-  if (inlined_cost.code > invoke_cost) {
+  float invoke_cost = get_invoke_cost(callee, inlined_cost->result_used);
+  if (inlined_cost->code + cross_dex_penalty > invoke_cost) {
+    *no_return = inlined_cost->no_return;
     return false;
   }
 
+  *dead_blocks = &inlined_cost->dead_blocks;
+  *insn_size = inlined_cost->insn_size;
   return true;
 }
 
@@ -1893,7 +2025,6 @@ bool MultiMethodInliner::cannot_inline_opcodes(
     const DexMethod* callee,
     const IRInstruction* invk_insn,
     std::vector<DexMethod*>* make_static) {
-  int ret_count = 0;
   bool can_inline = true;
   editable_cfg_adapter::iterate(
       callee->get_code(), [&](const MethodItemEntry& mie) {
@@ -1944,25 +2075,8 @@ bool MultiMethodInliner::cannot_inline_opcodes(
           can_inline = false;
           return editable_cfg_adapter::LOOP_BREAK;
         }
-        if (opcode::is_a_return(insn->opcode())) {
-          ++ret_count;
-        }
         return editable_cfg_adapter::LOOP_CONTINUE;
       });
-  // The IRCode inliner can't handle callees with more than one return
-  // statement (normally one, the way dx generates code). That allows us to
-  // make a simple inline strategy where we don't have to worry about creating
-  // branches from the multiple returns to the main code
-  //
-  // d8 however, generates code with multiple return statements in general.
-  // The CFG inliner can handle multiple return callees.
-  if (ret_count > 1 && !m_config.use_cfg_inliner) {
-    info.multi_ret++;
-    if (invk_insn) {
-      log_nopt(INL_MULTIPLE_RETURNS, callee);
-    }
-    can_inline = false;
-  }
   return !can_inline;
 }
 
@@ -2180,7 +2294,8 @@ CalleeCallerRefs MultiMethodInliner::get_callee_caller_refs(
 
   const auto& callers = callee_caller.at(callee);
   std::unordered_set<DexType*> caller_classes;
-  for (auto caller : callers) {
+  for (auto& p : callers) {
+    auto caller = p.first;
     caller_classes.insert(caller->get_class());
   }
   auto callee_class = callee->get_class();
@@ -2262,406 +2377,15 @@ void MultiMethodInliner::delayed_invoke_direct_to_static() {
       });
 }
 
-namespace {
-
-using RegMap = transform::RegMap;
-
-/*
- * Expands the caller register file by the size of the callee register file,
- * and allocates the high registers to the callee. E.g. if we have a caller
- * with registers_size of M and a callee with registers_size N, this function
- * will resize the caller's register file to M + N and map register k in the
- * callee to M + k in the caller. It also inserts move instructions to map the
- * callee arguments to the newly allocated registers.
- */
-std::unique_ptr<RegMap> gen_callee_reg_map(IRCode* caller_code,
-                                           const IRCode* callee_code,
-                                           const IRList::iterator& invoke_it) {
-  auto callee_reg_start = caller_code->get_registers_size();
-  auto insn = invoke_it->insn;
-  auto reg_map = std::make_unique<RegMap>();
-
-  // generate the callee register map
-  for (reg_t i = 0; i < callee_code->get_registers_size(); ++i) {
-    reg_map->emplace(i, callee_reg_start + i);
-  }
-
-  // generate and insert the move instructions
-  auto param_insns = InstructionIterable(callee_code->get_param_instructions());
-  auto param_it = param_insns.begin();
-  auto param_end = param_insns.end();
-  for (size_t i = 0; i < insn->srcs_size(); ++i, ++param_it) {
-    always_assert(param_it != param_end);
-    auto mov = (new IRInstruction(
-                    opcode::load_param_to_move(param_it->insn->opcode())))
-                   ->set_src(0, insn->src(i))
-                   ->set_dest(callee_reg_start + param_it->insn->dest());
-    caller_code->insert_before(invoke_it, mov);
-  }
-  caller_code->set_registers_size(callee_reg_start +
-                                  callee_code->get_registers_size());
-  return reg_map;
-}
-
-/**
- * Create a move instruction given a return instruction in a callee and
- * a move-result instruction in a caller.
- */
-IRInstruction* move_result(IRInstruction* res, IRInstruction* move_res) {
-  auto move_opcode = opcode::return_to_move(res->opcode());
-  IRInstruction* move = (new IRInstruction(move_opcode))
-                            ->set_dest(move_res->dest())
-                            ->set_src(0, res->src(0));
-  return move;
-}
-
-/*
- * Map the callee's param registers to the argument registers of the caller.
- * Any other callee register N will get mapped to caller_registers_size + N.
- * The resulting callee code can then be appended to the caller's code without
- * any register conflicts.
- */
-void remap_callee_for_tail_call(const IRCode* caller_code,
-                                IRCode* callee_code,
-                                const IRList::iterator& invoke_it) {
-  RegMap reg_map;
-  auto insn = invoke_it->insn;
-  auto callee_reg_start = caller_code->get_registers_size();
-
-  auto param_insns = InstructionIterable(callee_code->get_param_instructions());
-  auto param_it = param_insns.begin();
-  auto param_end = param_insns.end();
-  for (size_t i = 0; i < insn->srcs_size(); ++i, ++param_it) {
-    always_assert_log(param_it != param_end, "no param insns\n%s",
-                      SHOW(callee_code));
-    reg_map[param_it->insn->dest()] = insn->src(i);
-  }
-  for (size_t i = 0; i < callee_code->get_registers_size(); ++i) {
-    if (reg_map.count(i) != 0) {
-      continue;
-    }
-    reg_map[i] = callee_reg_start + i;
-  }
-  transform::remap_registers(callee_code, reg_map);
-}
-
-} // namespace
-
-/*
- * For splicing a callee's IRList into a caller.
- */
-class MethodSplicer {
-  IRCode* m_mtcaller;
-  MethodItemEntryCloner m_mie_cloner;
-  const RegMap& m_callee_reg_map;
-  DexPosition* m_invoke_position;
-  MethodItemEntry* m_active_catch;
-  std::unordered_set<reg_t> m_valid_dbg_regs;
-
- public:
-  MethodSplicer(IRCode* mtcaller,
-                const RegMap& callee_reg_map,
-                DexPosition* invoke_position,
-                MethodItemEntry* active_catch)
-      : m_mtcaller(mtcaller),
-        m_callee_reg_map(callee_reg_map),
-        m_invoke_position(invoke_position),
-        m_active_catch(active_catch) {}
-
-  MethodItemEntry* clone(MethodItemEntry* mie) {
-    auto result = m_mie_cloner.clone(mie);
-    return result;
-  }
-
-  void operator()(const IRList::iterator& insert_pos,
-                  const IRList::iterator& fcallee_start,
-                  const IRList::iterator& fcallee_end) {
-    std::vector<DexPosition*> positions_to_fix;
-    for (auto it = fcallee_start; it != fcallee_end; ++it) {
-      if (should_skip_debug(&*it)) {
-        continue;
-      }
-      if (it->type == MFLOW_OPCODE &&
-          opcode::is_a_load_param(it->insn->opcode())) {
-        continue;
-      }
-      auto mie = clone(&*it);
-      transform::remap_registers(*mie, m_callee_reg_map);
-      if (mie->type == MFLOW_TRY && m_active_catch != nullptr) {
-        auto tentry = mie->tentry;
-        // try ranges cannot be nested, so we flatten them here
-        switch (tentry->type) {
-        case TRY_START:
-          m_mtcaller->insert_before(
-              insert_pos, *(new MethodItemEntry(TRY_END, m_active_catch)));
-          m_mtcaller->insert_before(insert_pos, *mie);
-          break;
-        case TRY_END:
-          m_mtcaller->insert_before(insert_pos, *mie);
-          m_mtcaller->insert_before(
-              insert_pos, *(new MethodItemEntry(TRY_START, m_active_catch)));
-          break;
-        }
-      } else {
-        if (mie->type == MFLOW_POSITION && mie->pos->parent == nullptr) {
-          mie->pos->parent = m_invoke_position;
-        }
-        // if a handler list does not terminate in a catch-all, have it point
-        // to the parent's active catch handler. TODO: Make this more precise
-        // by checking if the parent catch type is a subtype of the callee's.
-        if (mie->type == MFLOW_CATCH && mie->centry->next == nullptr &&
-            mie->centry->catch_type != nullptr) {
-          mie->centry->next = m_active_catch;
-        }
-        m_mtcaller->insert_before(insert_pos, *mie);
-      }
-    }
-  }
-
-  void fix_parent_positions() {
-    m_mie_cloner.fix_parent_positions(m_invoke_position);
-  }
-
- private:
-  /* We need to skip two cases:
-   * Duplicate DBG_SET_PROLOGUE_END
-   * Uninitialized parameters
-   *
-   * The parameter names are part of the debug info for the method.
-   * The technically correct solution would be to make a start
-   * local for each of them.  However, that would also imply another
-   * end local after the tail to correctly set what the register
-   * is at the end.  This would bloat the debug info parameters for
-   * a corner case.
-   *
-   * Instead, we just delete locals lifetime information for parameters.
-   * This is an exceedingly rare case triggered by goofy code that
-   * reuses parameters as locals.
-   */
-  bool should_skip_debug(const MethodItemEntry* mei) {
-    if (mei->type != MFLOW_DEBUG) {
-      return false;
-    }
-    switch (mei->dbgop->opcode()) {
-    case DBG_SET_PROLOGUE_END:
-      return true;
-    case DBG_START_LOCAL:
-    case DBG_START_LOCAL_EXTENDED: {
-      auto reg = mei->dbgop->uvalue();
-      m_valid_dbg_regs.insert(reg);
-      return false;
-    }
-    case DBG_END_LOCAL:
-    case DBG_RESTART_LOCAL: {
-      auto reg = mei->dbgop->uvalue();
-      if (m_valid_dbg_regs.find(reg) == m_valid_dbg_regs.end()) {
-        return true;
-      }
-    }
-      FALLTHROUGH_INTENDED;
-    default:
-      return false;
-    }
-  }
-};
-
 namespace inliner {
-
-DexPosition* last_position_before(const IRList::const_iterator& it,
-                                  const IRCode* code) {
-  // we need to decrement the reverse iterator because it gets constructed
-  // as pointing to the element preceding pos
-  auto position_it = std::prev(IRList::const_reverse_iterator(it));
-  const auto& rend = code->rend();
-  while (++position_it != rend && position_it->type != MFLOW_POSITION)
-    ;
-  return position_it == rend ? nullptr : position_it->pos.get();
-}
-
-void inline_method(DexMethod* caller,
-                   IRCode* callee_code,
-                   const IRList::iterator& pos) {
-  change_visibility(callee_code, caller->get_class(), caller);
-  inline_method_unsafe(caller, caller->get_code(), callee_code, pos);
-}
-
-void inline_method_unsafe(const DexMethod* caller_method,
-                          IRCode* caller_code,
-                          IRCode* callee_code,
-                          const IRList::iterator& pos) {
-  TRACE(INL, 5, "caller code:\n%s", SHOW(caller_code));
-  TRACE(INL, 5, "callee code:\n%s", SHOW(callee_code));
-
-  if (caller_code->get_debug_item() == nullptr && caller_method != nullptr) {
-    // Create an empty item so that debug info of inlinee does not get lost.
-    caller_code->set_debug_item(std::make_unique<DexDebugItem>());
-    // Create a fake position.
-    auto it = caller_code->main_block();
-    if (it != caller_code->end()) {
-      caller_code->insert_after(
-          caller_code->main_block(),
-          *(new MethodItemEntry(
-              DexPosition::make_synthetic_entry_position(caller_method))));
-    } else {
-      caller_code->push_back(*(new MethodItemEntry(
-          DexPosition::make_synthetic_entry_position(caller_method))));
-    }
-  }
-
-  auto callee_reg_map = gen_callee_reg_map(caller_code, callee_code, pos);
-
-  // find the move-result after the invoke, if any. Must be the first
-  // instruction after the invoke
-  auto move_res = pos;
-  while (move_res++ != caller_code->end() && move_res->type != MFLOW_OPCODE)
-    ;
-  if (!opcode::is_a_move_result(move_res->insn->opcode())) {
-    move_res = caller_code->end();
-  }
-
-  // find the last position entry before the invoke.
-  const auto invoke_position = last_position_before(pos, caller_code);
-  if (invoke_position) {
-    TRACE(INL, 3, "Inlining call at %s:%d", invoke_position->file->c_str(),
-          invoke_position->line);
-  }
-
-  // check if we are in a try block
-  auto caller_catch = transform::find_active_catch(caller_code, pos);
-
-  const auto& ret_it = std::find_if(
-      callee_code->begin(), callee_code->end(), [](const MethodItemEntry& mei) {
-        return mei.type == MFLOW_OPCODE &&
-               opcode::is_a_return(mei.insn->opcode());
-      });
-
-  auto splice = MethodSplicer(caller_code, *callee_reg_map, invoke_position,
-                              caller_catch);
-  // Copy the callee up to the return. Everything else we push at the end
-  // of the caller
-  splice(pos, callee_code->begin(), ret_it);
-
-  // try items can span across a return opcode
-  auto callee_catch =
-      splice.clone(transform::find_active_catch(callee_code, ret_it));
-  if (callee_catch != nullptr) {
-    caller_code->insert_before(pos,
-                               *(new MethodItemEntry(TRY_END, callee_catch)));
-    if (caller_catch != nullptr) {
-      caller_code->insert_before(
-          pos, *(new MethodItemEntry(TRY_START, caller_catch)));
-    }
-  }
-
-  if (move_res != caller_code->end() && ret_it != callee_code->end()) {
-    auto ret_insn = std::make_unique<IRInstruction>(*ret_it->insn);
-    transform::remap_registers(ret_insn.get(), *callee_reg_map);
-    IRInstruction* move = move_result(ret_insn.get(), move_res->insn);
-    auto move_mei = new MethodItemEntry(move);
-    caller_code->insert_before(pos, *move_mei);
-  }
-  // ensure that the caller's code after the inlined method retain their
-  // original position
-  if (invoke_position) {
-    caller_code->insert_before(
-        pos,
-        *(new MethodItemEntry(
-            std::make_unique<DexPosition>(*invoke_position))));
-  }
-
-  // remove invoke
-  caller_code->erase_and_dispose(pos);
-  // remove move_result
-  if (move_res != caller_code->end()) {
-    caller_code->erase_and_dispose(move_res);
-  }
-
-  if (ret_it != callee_code->end()) {
-    if (callee_catch != nullptr) {
-      caller_code->push_back(*(new MethodItemEntry(TRY_START, callee_catch)));
-    } else if (caller_catch != nullptr) {
-      caller_code->push_back(*(new MethodItemEntry(TRY_START, caller_catch)));
-    }
-
-    if (std::next(ret_it) != callee_code->end()) {
-      const auto return_position = last_position_before(ret_it, callee_code);
-      if (return_position) {
-        // If there are any opcodes between the callee's return and its next
-        // position, we need to re-mark them with the correct line number,
-        // otherwise they would inherit the line number from the end of the
-        // caller.
-        auto new_pos = std::make_unique<DexPosition>(*return_position);
-        // We want its parent to be the same parent as other inlined code.
-        new_pos->parent = invoke_position;
-        caller_code->push_back(*(new MethodItemEntry(std::move(new_pos))));
-      }
-    }
-
-    // Copy the opcodes in the callee after the return and put them at the end
-    // of the caller.
-    splice(caller_code->end(), std::next(ret_it), callee_code->end());
-    if (caller_catch != nullptr) {
-      caller_code->push_back(*(new MethodItemEntry(TRY_END, caller_catch)));
-    }
-  }
-  splice.fix_parent_positions();
-  TRACE(INL, 5, "post-inline caller code:\n%s", SHOW(caller_code));
-}
-
-void inline_tail_call(DexMethod* caller,
-                      DexMethod* callee,
-                      IRList::iterator pos) {
-  TRACE(INL, 2, "caller: %s\ncallee: %s", SHOW(caller), SHOW(callee));
-  auto* caller_code = caller->get_code();
-  auto* callee_code = callee->get_code();
-
-  remap_callee_for_tail_call(caller_code, callee_code, pos);
-  caller_code->set_registers_size(caller_code->get_registers_size() +
-                                  callee_code->get_registers_size());
-
-  callee_code->cleanup_debug();
-  auto it = callee_code->begin();
-  while (it != callee_code->end()) {
-    auto& mei = *it++;
-    if (mei.type == MFLOW_OPCODE &&
-        opcode::is_a_load_param(mei.insn->opcode())) {
-      continue;
-    }
-    callee_code->erase(callee_code->iterator_to(mei));
-    caller_code->insert_before(pos, mei);
-  }
-  // Delete the vestigial tail.
-  while (pos != caller_code->end()) {
-    if (pos->type == MFLOW_OPCODE) {
-      pos = caller_code->erase_and_dispose(pos);
-    } else {
-      ++pos;
-    }
-  }
-}
-
-namespace impl {
-
-struct BlockAccessor {
-  static void push_dex_pos(cfg::Block* b,
-                           std::unique_ptr<DexPosition> dex_pos) {
-    auto it = b->get_first_non_param_loading_insn();
-    auto mie = new MethodItemEntry(std::move(dex_pos));
-    if (it == b->end()) {
-      b->m_entries.push_back(*mie);
-    } else {
-      b->m_entries.insert_before(it, *mie);
-    }
-  }
-};
-
-} // namespace impl
 
 // return true on successful inlining, false otherwise
 bool inline_with_cfg(DexMethod* caller_method,
                      DexMethod* callee_method,
                      IRInstruction* callsite,
-                     size_t next_caller_reg) {
+                     DexType* needs_receiver_cast,
+                     size_t next_caller_reg,
+                     const std::unordered_set<cfg::Block*>* dead_blocks) {
 
   auto caller_code = caller_method->get_code();
   always_assert(caller_code->editable_cfg_built());
@@ -2681,8 +2405,9 @@ bool inline_with_cfg(DexMethod* caller_method,
     // Create an empty item so that debug info of inlinee does not get lost.
     caller_code->set_debug_item(std::make_unique<DexDebugItem>());
     // Create a fake position.
-    impl::BlockAccessor::push_dex_pos(
+    caller_cfg.insert_before(
         caller_cfg.entry_block(),
+        caller_cfg.entry_block()->get_first_non_param_loading_insn(),
         DexPosition::make_synthetic_entry_position(caller_method));
   }
 
@@ -2693,8 +2418,8 @@ bool inline_with_cfg(DexMethod* caller_method,
 
   auto callee_code = callee_method->get_code();
   always_assert(callee_code->editable_cfg_built());
-  cfg::CFGInliner::inline_cfg(&caller_cfg, callsite_it, callee_code->cfg(),
-                              next_caller_reg);
+  cfg::CFGInliner::inline_cfg(&caller_cfg, callsite_it, needs_receiver_cast,
+                              callee_code->cfg(), next_caller_reg, dead_blocks);
 
   return true;
 }

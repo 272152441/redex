@@ -161,6 +161,7 @@ struct RedexContext {
     m_pointers_cache_loaded = true;
   }
   const FrequentlyUsedPointers& pointers_cache() {
+    std::lock_guard<std::mutex> lock(s_field_lock);
     if (!m_pointers_cache_loaded) {
       redex_assert(!kDebugPointersCacheLoad);
       load_pointers_cache();
@@ -189,6 +190,10 @@ struct RedexContext {
       return std::numeric_limits<size_t>::max();
     }
     return it->second;
+  }
+  const std::unordered_map<std::string, size_t>& get_sb_interaction_indices()
+      const {
+    return m_sb_interaction_indices;
   }
   void set_sb_interaction_index(
       const std::unordered_map<std::string, size_t>& input);
